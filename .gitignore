@@ -1,0 +1,5 @@
+.yanxing/
+*.db
+*.db-wal
+*.db-shm
+.yanxing-state.json
