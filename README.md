@@ -5,7 +5,7 @@
 A lightweight, dependency-free Windows terminal TUI for English typing and dictation practice:
 
 -   Responsive two-pane / single-pane workspace (practice card + clickable queue at `>= 80` columns; compact single pane below `80` columns);
--   Typing and Dictation modes (dictation hides English spelling, shows translation-only prev/next previews, and records mistakes only when misspelled);
+-   Typing and Dictation modes (dictation hides English spelling, shows translation-only prev/next previews, adds an item to the mistake book after more than 3 wrong keystrokes without leaking the answer, and removes it once typed accurately in the mistake book);
 -   CJK-exact column width calculation with line-level incremental diff rendering;
 -   SGR mouse support for the top bar, bottom bar, overlays, and word queue;
 -   14 built-in offline word & sentence decks, local `.txt` import, and OpenAI-compatible AI deck generation.

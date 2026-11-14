@@ -1,4 +1,4 @@
-﻿param(
+param(
   [Alias('b')][string]$Book = '',
   [Alias('g')][int]$Group = 0,
   [Alias('s')][int]$Size = 20,
@@ -260,8 +260,8 @@ if ($rawStateJson) {
 function Save-State {
   try {
     $obj = @{
-      book     = $State.DeckId
-      group    = $State.Group
+      book     = $Persisted.book
+      group    = $Persisted.group
       aiUrl    = $Persisted.aiUrl
       aiKey    = $Persisted.aiKey
       aiModel  = $Persisted.aiModel
@@ -384,6 +384,7 @@ $State = [ordered]@{
   Typed       = ''
   HasError    = $false
   WordWrong   = $false
+  WordErrors  = 0
   Peek        = $false
   Dictation   = [bool]$Dictation
   CorrectKeys = 0
@@ -416,6 +417,7 @@ function Set-Group([int]$groupNum) {
   $State.Typed = ''
   $State.HasError = $false
   $State.WordWrong = $false
+  $State.WordErrors = 0
   $State.Peek = $false
   $State.CorrectKeys = 0
   $State.TotalKeys = 0
@@ -423,6 +425,8 @@ function Set-Group([int]$groupNum) {
   $State.StartTime = $null
   $State.Finished = $false
   if ($State.DeckId -ne 'mistakes' -and $State.DeckId -ne 'custom' -and $State.DeckId -ne 'ai') {
+    $Persisted.book = $State.DeckId
+    $Persisted.group = $State.Group
     Save-State
   }
 }
@@ -446,6 +450,16 @@ function Add-Mistake($item) {
     })
     Save-State
   }
+}
+
+function Remove-Mistake($item) {
+  $before = @($Persisted.mistakes).Count
+  $Persisted.mistakes = @($Persisted.mistakes | Where-Object { $_.target -ne $item.target })
+  if (@($Persisted.mistakes).Count -lt $before) {
+    Save-State
+    return $true
+  }
+  return $false
 }
 
 if ($File) {
@@ -818,7 +832,7 @@ function Handle-Action([string]$action, $val = $null) {
     'open-group' { Open-ListOverlay 'group' }
     'open-mistakes' {
       if ($Persisted.mistakes.Count -eq 0) {
-        $State.StatusMsg = '错题本目前为空（练习拼错的词会自动收录）'
+        $State.StatusMsg = '错题本目前为空（听写模式下单条敲错超过 3 次自动收录）'
       } else {
         $State.Overlay = 'none'
         $State.DeckId = 'mistakes'
@@ -826,7 +840,7 @@ function Handle-Action([string]$action, $val = $null) {
         $State.Entries = [System.Collections.Generic.List[object]]::new()
         foreach ($m in $Persisted.mistakes) { $State.Entries.Add($m) }
         Set-Group 1
-        $State.StatusMsg = "已进入错题本，共 $($State.Entries.Count) 条"
+        $State.StatusMsg = "已进入错题本，共 $($State.Entries.Count) 条（答对自动移除）"
         if ($State.Items.Count -gt 0) { Speak-Text $State.Items[0].target }
       }
     }
@@ -846,7 +860,7 @@ function Handle-Action([string]$action, $val = $null) {
       if ($State.Items.Count -gt 1) {
         $rnd = [System.Random]::new()
         $State.Items = @($State.Items | Sort-Object { $rnd.Next() })
-        $State.Index = 0; $State.Typed = ''; $State.Peek = $false; $State.DoneSet = @{}
+        $State.Index = 0; $State.Typed = ''; $State.HasError = $false; $State.WordWrong = $false; $State.WordErrors = 0; $State.Peek = $false; $State.DoneSet = @{}
         $State.StatusMsg = '已随机打乱本组顺序'
         Speak-Text $State.Items[0].target
       }
@@ -866,7 +880,7 @@ function Handle-Action([string]$action, $val = $null) {
     'jump-word' {
       $qi = [int]$val
       if ($qi -ge 0 -and $qi -lt $State.Items.Count) {
-        $State.Index = $qi; $State.Typed = ''; $State.HasError = $false; $State.WordWrong = $false; $State.Peek = $false
+        $State.Index = $qi; $State.Typed = ''; $State.HasError = $false; $State.WordWrong = $false; $State.WordErrors = 0; $State.Peek = $false
         Speak-Text $State.Items[$State.Index].target
       }
     }
@@ -874,13 +888,13 @@ function Handle-Action([string]$action, $val = $null) {
     'peek'  { $State.Peek = -not $State.Peek }
     'prev-word' {
       if ($State.Index -gt 0) {
-        $State.Index--; $State.Typed = ''; $State.HasError = $false; $State.WordWrong = $false; $State.Peek = $false
+        $State.Index--; $State.Typed = ''; $State.HasError = $false; $State.WordWrong = $false; $State.WordErrors = 0; $State.Peek = $false
         Speak-Text $State.Items[$State.Index].target
       }
     }
     'next-word' {
       if ($State.Index + 1 -lt $State.Items.Count) {
-        $State.Index++; $State.Typed = ''; $State.HasError = $false; $State.WordWrong = $false; $State.Peek = $false
+        $State.Index++; $State.Typed = ''; $State.HasError = $false; $State.WordWrong = $false; $State.WordErrors = 0; $State.Peek = $false
         Speak-Text $State.Items[$State.Index].target
       }
     }
@@ -1052,12 +1066,17 @@ try {
         $State.Streak++
         if ($State.Streak -gt $State.MaxStreak) { $State.MaxStreak = $State.Streak }
         $State.DoneSet[$State.Index] = $true
+        if ($State.DeckId -eq 'mistakes' -and $State.WordErrors -eq 0) {
+          if (Remove-Mistake $item) {
+            $State.StatusMsg = "输入正确！已从错题本移除（剩余 $(@($Persisted.mistakes).Count) 条）"
+          }
+        }
         Render-Frame
         if ($State.Index + 1 -ge $State.Items.Count) {
           $State.Finished = $true; Render-Frame
         } else {
           Start-Sleep -Milliseconds 100
-          $State.Index++; $State.Typed = ''; $State.Peek = $false; $State.WordWrong = $false
+          $State.Index++; $State.Typed = ''; $State.Peek = $false; $State.WordWrong = $false; $State.WordErrors = 0
           Render-Frame
           Speak-Text $State.Items[$State.Index].target
         }
@@ -1067,14 +1086,19 @@ try {
     } else {
       $State.HasError = $true
       $State.Streak = 0
-      if (-not $State.WordWrong) {
-        $State.WordWrong = $true
-        if ($State.Dictation) {
-          Add-Mistake $item
-          $State.StatusMsg = '拼写错误，已自动加入错题本'
+      $State.WordErrors++
+      if ($State.Dictation) {
+        if ($State.WordErrors -gt 3) {
+          if (-not $State.WordWrong) {
+            $State.WordWrong = $true
+            Add-Mistake $item
+          }
+          $State.StatusMsg = "本词累计敲错 $($State.WordErrors) 次（超过 3 次），已加入错题本"
         } else {
-          $State.StatusMsg = '拼写有误，请继续'
+          $State.StatusMsg = "拼写有误（本词第 $($State.WordErrors) 次，超过 3 次加入错题本）"
         }
+      } else {
+        $State.StatusMsg = '拼写有误，请继续'
       }
       [Console]::Beep(400, 50)
       Render-Frame
