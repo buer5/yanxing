@@ -1,4 +1,4 @@
-param(
+﻿param(
   [Alias('b')][string]$Book = '',
   [Alias('g')][int]$Group = 0,
   [Alias('s')][int]$Size = 20,
@@ -142,29 +142,31 @@ function Speak-Text([string]$text) {
 
 # ── 统一 SQLite 数据库（与言行 App 共用 yanxing-user-1.db，进程内调用 winsqlite3.dll） ──
 $script:SqliteReady = $false
+$script:WinSqlitePath = Join-Path $env:WINDIR 'System32\winsqlite3.dll'
 try {
-  if (-not ('WinSqlite' -as [type])) {
+  if ((Test-Path $script:WinSqlitePath) -and -not ('WinSqlite' -as [type])) {
+    $dllEsc = $script:WinSqlitePath.Replace('\', '\\')
     Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
 using System.Text;
 
 public static class WinSqlite {
-    [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
+    [DllImport("$dllEsc", CallingConvention = CallingConvention.Cdecl)]
     public static extern int sqlite3_open_v2(byte[] filename, out IntPtr db, int flags, IntPtr zVfs);
-    [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
+    [DllImport("$dllEsc", CallingConvention = CallingConvention.Cdecl)]
     public static extern int sqlite3_close(IntPtr db);
-    [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
+    [DllImport("$dllEsc", CallingConvention = CallingConvention.Cdecl)]
     public static extern int sqlite3_prepare_v2(IntPtr db, byte[] sql, int nByte, out IntPtr stmt, out IntPtr tail);
-    [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
+    [DllImport("$dllEsc", CallingConvention = CallingConvention.Cdecl)]
     public static extern int sqlite3_step(IntPtr stmt);
-    [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
+    [DllImport("$dllEsc", CallingConvention = CallingConvention.Cdecl)]
     public static extern int sqlite3_finalize(IntPtr stmt);
-    [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
+    [DllImport("$dllEsc", CallingConvention = CallingConvention.Cdecl)]
     public static extern IntPtr sqlite3_column_text(IntPtr stmt, int iCol);
-    [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
+    [DllImport("$dllEsc", CallingConvention = CallingConvention.Cdecl)]
     public static extern int sqlite3_bind_text(IntPtr stmt, int idx, byte[] val, int nByte, IntPtr destructor);
-    [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
+    [DllImport("$dllEsc", CallingConvention = CallingConvention.Cdecl)]
     public static extern int sqlite3_bind_int64(IntPtr stmt, int idx, long val);
 
     public static string PtrToUtf8(IntPtr p) {
@@ -185,9 +187,11 @@ public static class WinSqlite {
 
 function Invoke-DbQuery([string]$sql, [object[]]$params = @()) {
   $rows = [System.Collections.Generic.List[object[]]]::new()
-  if (-not $script:SqliteReady) { return ,$rows }
+  if (-not $script:SqliteReady -or [string]::IsNullOrWhiteSpace($script:DbPath)) { return ,$rows }
   $db = [IntPtr]::Zero
-  if ([WinSqlite]::sqlite3_open_v2([System.Text.Encoding]::UTF8.GetBytes($DbPath + "`0"), [ref]$db, 6, [IntPtr]::Zero) -ne 0) { return ,$rows }
+  try {
+    if ([WinSqlite]::sqlite3_open_v2([System.Text.Encoding]::UTF8.GetBytes($script:DbPath + "`0"), [ref]$db, 6, [IntPtr]::Zero) -ne 0) { return ,$rows }
+  } catch { return ,$rows }
   try {
     foreach ($pSql in @('PRAGMA busy_timeout=3000;', $sql)) {
       $stmt = [IntPtr]::Zero; $tail = [IntPtr]::Zero
