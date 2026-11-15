@@ -34,12 +34,12 @@ $Catalog = @(
 if ($Help) {
   Write-Host "`n言行打字听写 TUI（双栏工作区 · CJK 精确增量渲染 · 按键/鼠标交互）`n" -ForegroundColor Cyan
   Write-Host "用法：yanxing [-b <id>] [-g <n>] [-s <n>] [-d] [-m] [-f <path>] [-l]"
-  Write-Host "快捷键（支持鼠标直接点击）："
+  Write-Host "快捷键（支持鼠标直接点击与滚轮）："
   Write-Host "  F1 / Ctrl+B  切换词库    |  F2 / Ctrl+G  切换分组"
   Write-Host "  F3 / Ctrl+M  跟打/听写   |  F4 / Ctrl+V  语音开关"
-  Write-Host "  F5           错题本练习  |  F6           乱序当前组"
+  Write-Host "  F5           查看错题本  |  F6           乱序当前组"
   Write-Host "  Ctrl+L       导入文本    |  Ctrl+A       AI 生成词库"
-  Write-Host "  Enter        重听发音    |  Tab          显隐拼写"
+  Write-Host "  Enter        重听发音    |  Tab          显隐拼写(非错题本)"
   Write-Host "  PgUp/PgDn    上/下一词   |  Esc / Ctrl+C 退出`n"
   return
 }
@@ -140,7 +140,173 @@ function Speak-Text([string]$text) {
   try { $null = $Voice.Speak($text, 3) } catch {}
 }
 
-# ── 统一 SQLite 数据库（与言行 App 共用 yanxing-user-1.db，进程内调用 winsqlite3.dll） ──
+# ── Win32 控制台原语（解决 Windows Terminal / conhost 下快速编辑抢占与鼠标点击丢包） ──
+try {
+  if (-not ('WinConsole' -as [type])) {
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+
+[StructLayout(LayoutKind.Sequential)]
+public struct YxCoord { public short X; public short Y; }
+
+[StructLayout(LayoutKind.Sequential)]
+public struct YxSmallRect { public short Left; public short Top; public short Right; public short Bottom; }
+
+[StructLayout(LayoutKind.Sequential)]
+public struct YxCsbi {
+    public YxCoord dwSize;
+    public YxCoord dwCursorPosition;
+    public ushort wAttributes;
+    public YxSmallRect srWindow;
+    public YxCoord dwMaximumWindowSize;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public struct YxKeyEvent {
+    public int bKeyDown;
+    public ushort wRepeatCount;
+    public ushort wVirtualKeyCode;
+    public ushort wVirtualScanCode;
+    public ushort UnicodeChar;
+    public uint dwControlKeyState;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public struct YxMouseEvent {
+    public YxCoord dwMousePosition;
+    public uint dwButtonState;
+    public uint dwControlKeyState;
+    public uint dwEventFlags;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public struct YxWindowBufEvent {
+    public YxCoord dwSize;
+}
+
+[StructLayout(LayoutKind.Explicit)]
+public struct YxInputRecord {
+    [FieldOffset(0)] public ushort EventType;
+    [FieldOffset(4)] public YxKeyEvent KeyEvent;
+    [FieldOffset(4)] public YxMouseEvent MouseEvent;
+    [FieldOffset(4)] public YxWindowBufEvent WindowBufferSizeEvent;
+}
+
+public static class WinConsole {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr GetStdHandle(int nStdHandle);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetConsoleMode(IntPtr h, out uint mode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetConsoleMode(IntPtr h, uint mode);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool ReadConsoleInputW(IntPtr h, [Out] YxInputRecord[] buf, uint len, out uint read);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool PeekConsoleInputW(IntPtr h, [Out] YxInputRecord[] buf, uint len, out uint read);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetConsoleScreenBufferInfo(IntPtr h, out YxCsbi info);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern IntPtr CreateFileW(string name, uint access, uint share, IntPtr sa, uint disp, uint flags, IntPtr tmpl);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr h);
+
+    private static IntPtr _hIn = IntPtr.Zero;
+    private static IntPtr _hOut = IntPtr.Zero;
+    private static bool _ownsIn = false;
+    private static bool _ownsOut = false;
+    private static uint _origInMode = 0;
+    private static bool _hasMode = false;
+
+    public static bool InitMouse() {
+        IntPtr stdIn = GetStdHandle(-10);
+        uint m = 0;
+        if (stdIn != IntPtr.Zero && stdIn != (IntPtr)(-1) && GetConsoleMode(stdIn, out m)) {
+            _hIn = stdIn;
+            _ownsIn = false;
+        } else if (!Console.IsInputRedirected) {
+            IntPtr cf = CreateFileW("CONIN$", 0xC0000000u, 3u, IntPtr.Zero, 3u, 0u, IntPtr.Zero);
+            if (cf != IntPtr.Zero && cf != (IntPtr)(-1) && GetConsoleMode(cf, out m)) {
+                _hIn = cf;
+                _ownsIn = true;
+            } else {
+                return false;
+            }
+        } else {
+            return false;
+        }
+        IntPtr stdOut = GetStdHandle(-11);
+        YxCsbi csbi;
+        if (stdOut != IntPtr.Zero && stdOut != (IntPtr)(-1) && GetConsoleScreenBufferInfo(stdOut, out csbi)) {
+            _hOut = stdOut;
+            _ownsOut = false;
+        } else {
+            IntPtr co = CreateFileW("CONOUT$", 0xC0000000u, 3u, IntPtr.Zero, 3u, 0u, IntPtr.Zero);
+            if (co != IntPtr.Zero && co != (IntPtr)(-1)) { _hOut = co; _ownsOut = true; }
+        }
+        _origInMode = m;
+        _hasMode = true;
+        // Disable QuickEdit(0x40), VTInput(0x200), LineInput(0x02), EchoInput(0x04); enable Mouse(0x10), Window(0x08), Extended(0x80)
+        uint next = (m & ~0x0246u) | 0x0098u;
+        SetConsoleMode(_hIn, next);
+        return true;
+    }
+
+    public static void Restore() {
+        if (_hasMode && _hIn != IntPtr.Zero) {
+            SetConsoleMode(_hIn, _origInMode);
+            _hasMode = false;
+        }
+        if (_ownsIn && _hIn != IntPtr.Zero) { CloseHandle(_hIn); _hIn = IntPtr.Zero; _ownsIn = false; }
+        if (_ownsOut && _hOut != IntPtr.Zero) { CloseHandle(_hOut); _hOut = IntPtr.Zero; _ownsOut = false; }
+    }
+
+    public static void GetWindowOrigin(out int left, out int top) {
+        left = 0; top = 0;
+        YxCsbi info;
+        if (_hOut != IntPtr.Zero && GetConsoleScreenBufferInfo(_hOut, out info)) {
+            left = info.srWindow.Left;
+            top = info.srWindow.Top;
+        }
+    }
+
+    public static bool ReadNext(out YxInputRecord rec) {
+        rec = default(YxInputRecord);
+        if (_hIn == IntPtr.Zero) return false;
+        var buf = new YxInputRecord[1];
+        uint n;
+        if (!ReadConsoleInputW(_hIn, buf, 1, out n) || n == 0) return false;
+        rec = buf[0];
+        return true;
+    }
+
+    public static bool PeekKeyChar(out char ch) {
+        ch = '\0';
+        if (_hIn == IntPtr.Zero) return false;
+        var buf = new YxInputRecord[8];
+        uint n;
+        if (!PeekConsoleInputW(_hIn, buf, 8, out n) || n == 0) return false;
+        for (uint i = 0; i < n; i++) {
+            if (buf[i].EventType == 1 && buf[i].KeyEvent.bKeyDown != 0) {
+                ch = (char)buf[i].KeyEvent.UnicodeChar;
+                return ch != '\0';
+            }
+        }
+        return false;
+    }
+}
+"@
+  }
+} catch {}
+
+# ── 本地 SQLite 数据库（进程内调用 winsqlite3.dll） ──
 $script:SqliteReady = $false
 $script:WinSqlitePath = Join-Path $env:WINDIR 'System32\winsqlite3.dll'
 try {
@@ -299,7 +465,7 @@ function Load-DeckEntries($meta) {
     foreach ($r in $rows) {
       if ($r[0]) {
         $ph = if ($r[1]) { "/$($r[1].Trim('/'))/" } else { '' }
-        $list.Add(@{ target = $r[0]; phonetic = $ph; meaning = '来自言行 App 生词本' })
+        $list.Add(@{ target = $r[0]; phonetic = $ph; meaning = '来自言行生词本' })
       }
     }
     return ,$list
@@ -390,35 +556,37 @@ $initBook = if ($Book) { $Book } else { $Persisted.book }
 $initGroup = if ($Group -gt 0) { $Group } else { $Persisted.group }
 
 $State = [ordered]@{
-  Title       = ''
-  DeckId      = $initBook
-  Entries     = $null
-  Group       = $initGroup
-  TotalGroups = 1
-  Items       = @()
-  DoneSet     = @{}
-  Index       = 0
-  Typed       = ''
-  HasError    = $false
-  WordWrong   = $false
-  WordErrors  = 0
-  Peek        = $false
-  Dictation   = [bool]$Dictation
-  CorrectKeys = 0
-  TotalKeys   = 0
-  Streak      = 0
-  MaxStreak   = 0
-  StartTime   = $null
-  Finished    = $false
-  StatusMsg   = '就绪 · 直接输入即可开始'
-  Overlay     = 'none'   # 'none' | 'list' | 'mistakes' | 'input-file' | 'input-ai'
-  ListKind    = ''       # 'deck' | 'group'
-  ListTitle   = ''
-  ListHint    = ''
-  ListItems   = @()
-  PromptBuf   = ''
-  CursorIdx   = 0
-  ScrollTop   = 0
+  Title               = ''
+  DeckId              = $initBook
+  Entries             = $null
+  Group               = $initGroup
+  TotalGroups         = 1
+  Items               = @()
+  DoneSet             = @{}
+  Index               = 0
+  Typed               = ''
+  HasError            = $false
+  WordWrong           = $false
+  WordErrors          = 0
+  Peek                = $false
+  Dictation           = [bool]$Dictation
+  PreMistakeDictation = [bool]$Dictation
+  MistakeRound        = 1
+  CorrectKeys         = 0
+  TotalKeys           = 0
+  Streak              = 0
+  MaxStreak           = 0
+  StartTime           = $null
+  Finished            = $false
+  StatusMsg           = '就绪 · 直接输入即可开始'
+  Overlay             = 'none'   # 'none' | 'list' | 'mistakes' | 'input-file' | 'input-ai'
+  ListKind            = ''       # 'deck' | 'group'
+  ListTitle           = ''
+  ListHint            = ''
+  ListItems           = @()
+  PromptBuf           = ''
+  CursorIdx           = 0
+  ScrollTop           = 0
   ConfirmClearMistakes = $false
 }
 
@@ -435,30 +603,70 @@ function Get-EntrySlice($entries, [int]$s, [int]$e) {
 function Sync-MistakeDeckItems {
   if ($State.DeckId -ne 'mistakes') { return }
   $entries = [System.Collections.Generic.List[object]]::new()
-  foreach ($m in $Persisted.mistakes) { $entries.Add($m) }
+  $items = [System.Collections.Generic.List[object]]::new()
+  foreach ($m in $Persisted.mistakes) {
+    $entries.Add($m)
+    $items.Add($m)
+  }
   $State.Entries = $entries
+  $State.TotalGroups = 1
+  $State.Group = 1
+  $State.Items = $items
   if ($entries.Count -eq 0) {
-    $State.TotalGroups = 1
-    $State.Group = 1
-    $State.Items = [System.Collections.Generic.List[object]]::new()
     $State.Index = 0
     $State.Finished = $true
-    return
   }
-  $total = [Math]::Max(1, [int][Math]::Ceiling($entries.Count / $Size))
-  $safe = [Math]::Max(1, [Math]::Min($total, $State.Group))
-  $s = ($safe - 1) * $Size
-  $e = [Math]::Min($entries.Count - 1, $s + $Size - 1)
-  $State.TotalGroups = $total
-  $State.Group = $safe
-  $State.Items = Get-EntrySlice $entries $s $e
+}
+
+function Start-MistakePractice([int]$startIdx = 0) {
+  if ($State.DeckId -ne 'mistakes') {
+    $State.PreMistakeDictation = $State.Dictation
+  }
+  $State.Overlay = 'none'
+  $State.ConfirmClearMistakes = $false
+  $State.DeckId = 'mistakes'
+  $State.Title = '我的错题本'
+  $State.Dictation = $true
+  $State.Peek = $false
+  $State.MistakeRound = 1
+  Sync-MistakeDeckItems
+  $State.DoneSet = @{}
+  $State.Typed = ''
+  $State.HasError = $false
+  $State.WordWrong = $false
+  $State.WordErrors = 0
+  $State.CorrectKeys = 0
+  $State.TotalKeys = 0
+  $State.Streak = 0
+  $State.StartTime = $null
+  if ($State.Items.Count -gt 0) {
+    $State.Index = [Math]::Max(0, [Math]::Min($State.Items.Count - 1, $startIdx))
+    $State.Finished = $false
+    $State.StatusMsg = "错题本循环听写第 1 轮（共 $($Persisted.mistakes.Count) 条 · 0错移出，错1次跳过 · 禁Tab）"
+  } else {
+    $State.Index = 0
+    $State.Finished = $true
+    $State.StatusMsg = '错题本目前为空'
+  }
 }
 
 function Set-Group([int]$groupNum) {
   if ($State.DeckId -eq 'mistakes') {
-    $entries = [System.Collections.Generic.List[object]]::new()
-    foreach ($m in $Persisted.mistakes) { $entries.Add($m) }
-    $State.Entries = $entries
+    $State.Dictation = $true
+    $State.Peek = $false
+    Sync-MistakeDeckItems
+    $State.DoneSet = @{}
+    $State.Index = 0
+    $State.Typed = ''
+    $State.HasError = $false
+    $State.WordWrong = $false
+    $State.WordErrors = 0
+    $State.CorrectKeys = 0
+    $State.TotalKeys = 0
+    $State.Streak = 0
+    $State.StartTime = $null
+    $State.Finished = ($Persisted.mistakes.Count -eq 0)
+    return
   }
   $cnt = if ($State.Entries) { $State.Entries.Count } else { 0 }
   $total = [Math]::Max(1, [int][Math]::Ceiling($cnt / $Size))
@@ -479,8 +687,8 @@ function Set-Group([int]$groupNum) {
   $State.TotalKeys = 0
   $State.Streak = 0
   $State.StartTime = $null
-  $State.Finished = ($State.DeckId -eq 'mistakes' -and $cnt -eq 0)
-  if ($State.DeckId -ne 'mistakes' -and $State.DeckId -ne 'custom' -and $State.DeckId -ne 'ai') {
+  $State.Finished = $false
+  if ($State.DeckId -ne 'custom' -and $State.DeckId -ne 'ai') {
     $Persisted.book = $State.DeckId
     $Persisted.group = $State.Group
     Save-State
@@ -488,8 +696,17 @@ function Set-Group([int]$groupNum) {
 }
 
 function Select-DeckAndGroup([string]$deckId, [int]$groupNum) {
+  if ($deckId -ieq 'mistakes') {
+    Start-MistakePractice 0
+    return
+  }
+  if ($State.DeckId -eq 'mistakes') {
+    $State.Dictation = $State.PreMistakeDictation
+    $State.Peek = $false
+  }
   $meta = $Catalog | Where-Object { $_.id -ieq $deckId } | Select-Object -First 1
-  if (-not $meta) { $meta = $Catalog[2] }
+  if (-not $meta) { $meta = $Catalog | Where-Object { $_.id -eq 'ket2021' } | Select-Object -First 1 }
+  if (-not $meta) { $meta = $Catalog[0] }
   $entries = Load-DeckEntries $meta
   $State.DeckId = $meta.id
   $State.Title = $meta.name
@@ -593,6 +810,37 @@ function Build-TargetLines($item, [int]$innerW, [bool]$show) {
   return ,$res
 }
 
+function Format-ActionBtnRows([object[]]$btnSpecs, [int]$maxCols) {
+  $rows = [System.Collections.Generic.List[object]]::new()
+  $sb = [System.Text.StringBuilder]::new()
+  $x = 0
+  $hbs = [System.Collections.Generic.List[object]]::new()
+  foreach ($b in $btnSpecs) {
+    $bw = Get-DisplayWidth $b.text
+    $sp = if ($x -gt 0) { 1 } else { 0 }
+    if ($x -gt 0 -and ($x + $sp + $bw -gt $maxCols)) {
+      if ($x -lt $maxCols) { [void]$sb.Append(' ' * ($maxCols - $x)) }
+      $rows.Add(@{ text = $sb.ToString(); hitboxes = $hbs })
+      $sb = [System.Text.StringBuilder]::new()
+      $x = 0
+      $sp = 0
+      $hbs = [System.Collections.Generic.List[object]]::new()
+    }
+    if ($sp -gt 0) { [void]$sb.Append(' '); $x++ }
+    if ($x + $bw -le $maxCols) {
+      $col = if ($b.color) { $b.color } else { $C_WHITE }
+      [void]$sb.Append("$col$($b.text)$C_RESET")
+      $hbs.Add(@{ xOff = $x; width = $bw; action = $b.action; value = $b.value })
+      $x += $bw
+    }
+  }
+  if ($x -gt 0 -or $rows.Count -eq 0) {
+    if ($x -lt $maxCols) { [void]$sb.Append(' ' * ($maxCols - $x)) }
+    $rows.Add(@{ text = $sb.ToString(); hitboxes = $hbs })
+  }
+  return ,$rows
+}
+
 function Render-Frame {
   $w = [Math]::Max(24, [Console]::WindowWidth)
   $h = [Math]::Max(10, [Console]::WindowHeight)
@@ -610,19 +858,21 @@ function Render-Frame {
   $wpm = if ($State.StartTime) { [Math]::Round(($State.CorrectKeys / 5.0) / $elapsedMin) } else { 0 }
 
   # ── 顶栏（自动换行，小窗口也不截断按钮） ──
-  $modeText  = if ($State.Dictation) { '听写' } else { '跟打' }
+  $isMistakeDeck = ($State.DeckId -eq 'mistakes')
+  $modeText  = if ($isMistakeDeck) { '听写·锁' } elseif ($State.Dictation) { '听写' } else { '跟打' }
+  $grpText   = if ($isMistakeDeck) { "[F2 第$($State.MistakeRound)轮]" } else { "[F2 组:$($State.Group)/$($State.TotalGroups)]" }
   $soundText = if ($script:SoundOn) { '开' } else { '关' }
   $mCount    = $Persisted.mistakes.Count
   $deckLabel = if ($w -lt 70 -and (Get-DisplayWidth $State.Title) -gt 10) {
     (Fit-Plain $State.Title 8).TrimEnd() + '..'
   } else { $State.Title }
   $topItems = @(
-    @{ text = ' 言行 ';                                      color = "$C_BOLD$C_CYAN"; action = '' },
-    @{ text = "[F1 词库:$deckLabel]";                        color = $C_YELLOW;        action = 'open-deck' },
-    @{ text = "[F2 组:$($State.Group)/$($State.TotalGroups)]"; color = $C_CYAN;        action = 'open-group' },
-    @{ text = "[F3 $modeText]";                              color = $C_GREEN;         action = 'toggle-mode' },
-    @{ text = "[F4 音:$soundText]";                          color = $C_WHITE;         action = 'toggle-sound' },
-    @{ text = "[F5 错:$mCount]";                             color = $C_RED;           action = 'open-mistakes' }
+    @{ text = ' 言行 ';                   color = "$C_BOLD$C_CYAN"; action = '' },
+    @{ text = "[F1 词库:$deckLabel]";     color = $C_YELLOW;        action = 'open-deck' },
+    @{ text = $grpText;                   color = $C_CYAN;          action = 'open-group' },
+    @{ text = "[F3 $modeText]";           color = $C_GREEN;         action = 'toggle-mode' },
+    @{ text = "[F4 音:$soundText]";       color = $C_WHITE;         action = 'toggle-sound' },
+    @{ text = "[F5 错:$mCount]";          color = $C_RED;           action = 'open-mistakes' }
   )
   $topRows = [System.Collections.Generic.List[string]]::new()
   $topPendingHbs = [System.Collections.Generic.List[object]]::new()
@@ -655,17 +905,17 @@ function Render-Frame {
     $script:Hitboxes.Add(@{ y = 1 + $hb.row; x1 = $hb.x1; x2 = $hb.x2; action = $hb.action })
   }
 
-  # ── 底部快捷键与鼠标栏（自动换行，小窗口也不截断按钮） ──
-  $btns = @(
-    @{ text = '[Enter 朗读]';  action = 'speak' },
-    @{ text = '[Tab 提示]';    action = 'peek' },
-    @{ text = '[PgUp 上词]';   action = 'prev-word' },
-    @{ text = '[PgDn 下词]';   action = 'next-word' },
-    @{ text = '[F6 乱序]';     action = 'shuffle' },
-    @{ text = '[Ctrl+L 导入]'; action = 'open-file' },
-    @{ text = '[Ctrl+A AI]';   action = 'open-ai' },
-    @{ text = '[Esc 退出]';    action = 'exit' }
-  )
+  # ── 底部快捷键与鼠标栏（自动换行，小窗口也不截断按钮；错题本模式隐藏 Tab 提示） ──
+  $btns = [System.Collections.Generic.List[object]]::new()
+  $btns.Add(@{ text = '[Enter 朗读]';  action = 'speak' })
+  if (-not $isMistakeDeck) { $btns.Add(@{ text = '[Tab 提示]'; action = 'peek' }) }
+  $btns.Add(@{ text = '[PgUp 上词]';   action = 'prev-word' })
+  $btns.Add(@{ text = '[PgDn 下词]';   action = 'next-word' })
+  $btns.Add(@{ text = '[F6 乱序]';     action = 'shuffle' })
+  $btns.Add(@{ text = '[Ctrl+L 导入]'; action = 'open-file' })
+  $btns.Add(@{ text = '[Ctrl+A AI]';   action = 'open-ai' })
+  $btns.Add(@{ text = '[Esc 退出]';    action = 'exit' })
+
   $botRows = [System.Collections.Generic.List[string]]::new()
   $botPendingHbs = [System.Collections.Generic.List[object]]::new()
   $botSb = [System.Text.StringBuilder]::new("$C_BG_BAR ")
@@ -711,17 +961,26 @@ function Render-Frame {
                elseif ($State.Overlay -eq 'mistakes') { " 错题本 ($($Persisted.mistakes.Count) 条) " }
                elseif ($State.Overlay -eq 'input-file') { ' 导入本地文本 ' }
                elseif ($State.Overlay -eq 'input-ai') { ' AI 生成词库 ' }
+               elseif ($isMistakeDeck) { " 错题循环听写 · 第$($State.MistakeRound)轮 " }
                else { ' 练习区 ' }
   $ltPad = '─' * [Math]::Max(0, $mainW - 3 - (Get-DisplayWidth $leftTitle))
   $leftBuf.Add("$C_BORDER╭─$C_CYAN$C_BOLD$leftTitle$C_RESET$C_BORDER$ltPad╮$C_RESET")
 
   $leftContent = [System.Collections.Generic.List[string]]::new()
+  $leftHitboxes = [System.Collections.Generic.List[object]]::new()
   $contentH = [Math]::Max(1, $bodyRows - 2)
 
   if ($State.Overlay -eq 'list') {
     foreach ($hl in (Wrap-Plain $State.ListHint $mainInner)) { $leftContent.Add((Fit-Plain $hl $mainInner)) }
-    $headCount = $leftContent.Count + 1
-    $leftContent.Add((' ' * $mainInner))
+    $closeRows = Format-ActionBtnRows @(@{ text = '[Esc 返回练习]'; action = 'close-overlay'; color = $C_CYAN }) $mainInner
+    foreach ($cr in $closeRows) {
+      $rIdx = $leftContent.Count
+      $leftContent.Add($cr.text)
+      foreach ($hb in $cr.hitboxes) {
+        $leftHitboxes.Add(@{ row = $rIdx; x1 = 3 + $hb.xOff; x2 = 3 + $hb.xOff + $hb.width - 1; action = $hb.action; value = $hb.value })
+      }
+    }
+    $headCount = $leftContent.Count
     $items = $State.ListItems
     $maxShow = [Math]::Max(1, [Math]::Min($items.Count, $contentH - $headCount))
     if ($State.CursorIdx -lt $State.ScrollTop) { $State.ScrollTop = $State.CursorIdx }
@@ -731,8 +990,9 @@ function Render-Frame {
       $li = $items[$idx]
       $mark = if ($li.active) { '*' } else { ' ' }
       $txt = Fit-Plain "$mark $($li.label)" $mainInner
+      $rIdx = $leftContent.Count
       if ($idx -eq $State.CursorIdx) { $leftContent.Add("$C_BG_SEL$C_BOLD$txt$C_RESET") } else { $leftContent.Add($txt) }
-      $script:Hitboxes.Add(@{ y = $bodyStartIdx + 2 + $headCount + $i; x1 = 3; x2 = $mainW - 2; action = $li.action; value = $li.value })
+      $leftHitboxes.Add(@{ row = $rIdx; x1 = 3; x2 = $mainW - 2; action = $li.action; value = $li.value })
     }
   } elseif ($State.Overlay -eq 'mistakes') {
     $mList = $Persisted.mistakes
@@ -742,20 +1002,28 @@ function Render-Frame {
         $leftContent.Add((Fit-Plain $hl $mainInner))
       }
       $leftContent.Add((' ' * $mainInner))
-      $leftContent.Add("$C_CYAN" + (Fit-Plain "[Esc / F5] 返回练习" $mainInner) + $C_RESET)
+      $emptyBtns = Format-ActionBtnRows @(@{ text = '[Esc / F5 返回练习]'; action = 'close-overlay'; color = $C_CYAN }) $mainInner
+      foreach ($eb in $emptyBtns) {
+        $rIdx = $leftContent.Count
+        $leftContent.Add($eb.text)
+        foreach ($hb in $eb.hitboxes) {
+          $leftHitboxes.Add(@{ row = $rIdx; x1 = 3 + $hb.xOff; x2 = 3 + $hb.xOff + $hb.width - 1; action = $hb.action; value = $hb.value })
+        }
+      }
     } else {
       if ($State.CursorIdx -ge $mCnt) { $State.CursorIdx = $mCnt - 1 }
       if ($State.CursorIdx -lt 0) { $State.CursorIdx = 0 }
       $sel = $mList[$State.CursorIdx]
       $wc = if ($sel.wrongCount) { [int]$sel.wrongCount } else { 1 }
 
-      foreach ($hl in (Wrap-Plain "Up/Down 选词查看 | Enter 练习 | Space 朗读 | D/Del 移除 | C 清空" $mainInner)) {
+      foreach ($hl in (Wrap-Plain "点击/Up/Down 选词 | 点击下方按钮或按键操作" $mainInner)) {
         $leftContent.Add("$C_DIM" + (Fit-Plain $hl $mainInner) + $C_RESET)
       }
       $headCount = $leftContent.Count
 
-      # 底部详情区（完整展示当前选中错题的单词、音标与中文释义，绝不遮挡或截断）
+      # 底部详情区（完整展示当前选中错题的单词、音标与中文释义，并保留可点击换行按钮行）
       $detailLines = [System.Collections.Generic.List[string]]::new()
+      $detailHbs = [System.Collections.Generic.List[object]]::new()
       $detailLines.Add("$C_BORDER" + ('─' * $mainInner) + $C_RESET)
       $phPart = if ($sel.phonetic) { "  $($sel.phonetic)" } else { '' }
       foreach ($dl in (Wrap-Plain "单词：$($sel.target)$phPart  [错${wc}次]" $mainInner)) {
@@ -766,30 +1034,23 @@ function Render-Frame {
         $detailLines.Add("$C_YELLOW" + (Fit-Plain $dl $mainInner) + $C_RESET)
       }
 
-      # 详情区可点击操作按钮行
       $clearLbl = if ($State.ConfirmClearMistakes) { '[再按C确认清空]' } else { '[C 清空]' }
-      $mBtns = @(
-        @{ text = '[Enter 从此词练]'; action = 'practice-mistakes' },
-        @{ text = '[Space 朗读]';     action = 'speak-mistake' },
-        @{ text = '[D 移出]';         action = 'remove-mistake-at' },
-        @{ text = $clearLbl;          action = 'clear-mistakes' }
+      $clearCol = if ($State.ConfirmClearMistakes) { $C_RED } else { $C_WHITE }
+      $mBtnSpecs = @(
+        @{ text = '[Enter 循环听写]'; action = 'practice-mistakes'; color = $C_CYAN },
+        @{ text = '[Space 朗读]';     action = 'speak-mistake';     color = $C_WHITE },
+        @{ text = '[D 移出]';         action = 'remove-mistake-at'; color = $C_WHITE },
+        @{ text = $clearLbl;          action = 'clear-mistakes';    color = $clearCol },
+        @{ text = '[Esc 返回]';       action = 'close-overlay';     color = $C_DIM }
       )
-      $mbRowIdx = $contentH - 1
-      $mbSb = [System.Text.StringBuilder]::new()
-      $mbx = 0
-      $pendingMBtns = [System.Collections.Generic.List[object]]::new()
-      foreach ($mb in $mBtns) {
-        $mbw = Get-DisplayWidth $mb.text
-        $sp = if ($mbx -gt 0) { 1 } else { 0 }
-        if ($mbx + $sp + $mbw -gt $mainInner) { break }
-        if ($sp -gt 0) { [void]$mbSb.Append(' '); $mbx++ }
-        $col = if ($mb.action -eq 'clear-mistakes' -and $State.ConfirmClearMistakes) { $C_RED } elseif ($mb.action -eq 'practice-mistakes') { $C_CYAN } else { $C_WHITE }
-        [void]$mbSb.Append("$col$($mb.text)$C_RESET")
-        $pendingMBtns.Add(@{ x1 = 3 + $mbx; x2 = 3 + $mbx + $mbw - 1; action = $mb.action })
-        $mbx += $mbw
+      $mBtnRows = Format-ActionBtnRows $mBtnSpecs $mainInner
+      foreach ($br in $mBtnRows) {
+        $relRow = $detailLines.Count
+        $detailLines.Add($br.text)
+        foreach ($hb in $br.hitboxes) {
+          $detailHbs.Add(@{ relRow = $relRow; x1 = 3 + $hb.xOff; x2 = 3 + $hb.xOff + $hb.width - 1; action = $hb.action; value = $hb.value })
+        }
       }
-      if ($mbx -lt $mainInner) { [void]$mbSb.Append(' ' * ($mainInner - $mbx)) }
-      $detailLines.Add($mbSb.ToString())
 
       $listH = [Math]::Max(1, $contentH - $headCount - $detailLines.Count)
       $maxShow = [Math]::Min($mCnt, $listH)
@@ -801,23 +1062,21 @@ function Render-Frame {
         $mwc = if ($m.wrongCount) { [int]$m.wrongCount } else { 1 }
         $rowLabel = "{0,2}. {1} (错{2}次) - {3}" -f ($mi + 1), $m.target, $mwc, $(if ($m.meaning) { $m.meaning } else { '暂无释义' })
         $txt = Fit-Plain $rowLabel $mainInner
+        $rIdx = $leftContent.Count
         if ($mi -eq $State.CursorIdx) { $leftContent.Add("$C_BG_SEL$C_BOLD$txt$C_RESET") } else { $leftContent.Add($txt) }
-        $script:Hitboxes.Add(@{ y = $bodyStartIdx + 2 + $headCount + $i; x1 = 3; x2 = $mainW - 2; action = 'select-mistake'; value = $mi })
+        $leftHitboxes.Add(@{ row = $rIdx; x1 = 3; x2 = $mainW - 2; action = 'select-mistake'; value = $mi })
       }
       while ($leftContent.Count -lt ($contentH - $detailLines.Count)) {
         $leftContent.Add((' ' * $mainInner))
       }
-      $btnAdded = $false
+      $detailStart = $leftContent.Count
       foreach ($dl in $detailLines) {
-        if ($leftContent.Count -lt $contentH) {
-          $leftContent.Add($dl)
-          if ($dl -eq $detailLines[$detailLines.Count - 1]) { $btnAdded = $true }
-        }
+        if ($leftContent.Count -lt $contentH) { $leftContent.Add($dl) }
       }
-      if ($btnAdded) {
-        $btnY = $bodyStartIdx + 2 + ($leftContent.Count - 1)
-        foreach ($pb in $pendingMBtns) {
-          $script:Hitboxes.Add(@{ y = $btnY; x1 = $pb.x1; x2 = $pb.x2; action = $pb.action })
+      foreach ($dhb in $detailHbs) {
+        $absRow = $detailStart + $dhb.relRow
+        if ($absRow -lt $contentH) {
+          $leftHitboxes.Add(@{ row = $absRow; x1 = $dhb.x1; x2 = $dhb.x2; action = $dhb.action; value = $dhb.value })
         }
       }
     }
@@ -826,36 +1085,41 @@ function Render-Frame {
     $leftContent.Add((' ' * $mainInner))
     foreach ($pl in (Wrap-Plain "> $($State.PromptBuf)_" $mainInner)) { $leftContent.Add("$C_BG_SEL" + (Fit-Plain $pl $mainInner) + $C_RESET) }
     $leftContent.Add((' ' * $mainInner))
-    foreach ($hl in (Wrap-Plain "Enter 确认导入  |  Esc 取消" $mainInner)) { $leftContent.Add("$C_DIM" + (Fit-Plain $hl $mainInner) + $C_RESET) }
+    $inBtns = Format-ActionBtnRows @(@{ text = '[Enter 确认导入]'; action = 'confirm-overlay-input'; color = $C_CYAN }, @{ text = '[Esc 取消]'; action = 'close-overlay'; color = $C_DIM }) $mainInner
+    foreach ($ib in $inBtns) {
+      $rIdx = $leftContent.Count
+      $leftContent.Add($ib.text)
+      foreach ($hb in $ib.hitboxes) {
+        $leftHitboxes.Add(@{ row = $rIdx; x1 = 3 + $hb.xOff; x2 = 3 + $hb.xOff + $hb.width - 1; action = $hb.action })
+      }
+    }
   } elseif ($State.Overlay -eq 'input-ai') {
     foreach ($hl in (Wrap-Plain "当前模型：$($Persisted.aiModel) ($($Persisted.aiUrl))" $mainInner)) { $leftContent.Add((Fit-Plain $hl $mainInner)) }
     foreach ($hl in (Wrap-Plain "请输入主题（如：商务邮件、旅游英语）：" $mainInner)) { $leftContent.Add((Fit-Plain $hl $mainInner)) }
     $leftContent.Add((' ' * $mainInner))
     foreach ($pl in (Wrap-Plain "> $($State.PromptBuf)_" $mainInner)) { $leftContent.Add("$C_BG_SEL" + (Fit-Plain $pl $mainInner) + $C_RESET) }
     $leftContent.Add((' ' * $mainInner))
-    foreach ($hl in (Wrap-Plain "Enter 调用 AI 生成  |  Esc 取消" $mainInner)) { $leftContent.Add("$C_DIM" + (Fit-Plain $hl $mainInner) + $C_RESET) }
+    $inBtns = Format-ActionBtnRows @(@{ text = '[Enter 调用AI生成]'; action = 'confirm-overlay-input'; color = $C_CYAN }, @{ text = '[Esc 取消]'; action = 'close-overlay'; color = $C_DIM }) $mainInner
+    foreach ($ib in $inBtns) {
+      $rIdx = $leftContent.Count
+      $leftContent.Add($ib.text)
+      foreach ($hb in $ib.hitboxes) {
+        $leftHitboxes.Add(@{ row = $rIdx; x1 = 3 + $hb.xOff; x2 = 3 + $hb.xOff + $hb.width - 1; action = $hb.action })
+      }
+    }
   } elseif ($State.Finished) {
-    if ($State.DeckId -eq 'mistakes' -and $Persisted.mistakes.Count -eq 0) {
+    if ($isMistakeDeck) {
       $leftContent.Add("$C_GREEN$C_BOLD" + (Fit-Plain "* 恭喜！错题本已全部答对并清空！" $mainInner) + $C_RESET)
       $leftContent.Add((' ' * $mainInner))
-      foreach ($hl in (Wrap-Plain "正确率：$acc% | 速度：$wpm WPM | 最高连击：$($State.MaxStreak)" $mainInner)) {
+      foreach ($hl in (Wrap-Plain "正确率：$acc% | 速度：$wpm WPM | 最高连击：$($State.MaxStreak) | 循环轮数：$($State.MistakeRound)" $mainInner)) {
         $leftContent.Add((Fit-Plain $hl $mainInner))
       }
       $leftContent.Add((' ' * $mainInner))
-      foreach ($hl in (Wrap-Plain "[F1] 切换词库  [F5] 查看错题本  [Esc] 退出" $mainInner)) {
-        $leftContent.Add("$C_CYAN" + (Fit-Plain $hl $mainInner) + $C_RESET)
-      }
-    } elseif ($State.DeckId -eq 'mistakes') {
-      $leftContent.Add("$C_GREEN$C_BOLD" + (Fit-Plain "* 本轮错题练习完成！" $mainInner) + $C_RESET)
-      $leftContent.Add((' ' * $mainInner))
-      foreach ($hl in (Wrap-Plain "错题本仍剩余：$($Persisted.mistakes.Count) 条 | 正确率：$acc% | 速度：$wpm WPM" $mainInner)) {
-        $leftContent.Add((Fit-Plain $hl $mainInner))
-      }
-      $leftContent.Add((' ' * $mainInner))
-      $nextHint = if ($State.Group -lt $State.TotalGroups) { "[Enter] 下一组  [R] 重练剩余错题  [F5] 错题列表  [F1] 换词库" } else { "[R] 重练剩余错题  [F5] 错题列表  [F1] 换词库" }
-      foreach ($hl in (Wrap-Plain $nextHint $mainInner)) {
-        $leftContent.Add("$C_CYAN" + (Fit-Plain $hl $mainInner) + $C_RESET)
-      }
+      $finSpecs = @(
+        @{ text = '[F1 切换词库]';   action = 'open-deck';     color = $C_CYAN },
+        @{ text = '[F5 查看错题本]'; action = 'open-mistakes'; color = $C_CYAN },
+        @{ text = '[Esc 退出]';      action = 'exit';          color = $C_WHITE }
+      )
     } else {
       $leftContent.Add("$C_GREEN$C_BOLD" + (Fit-Plain "* 本组练习完成！" $mainInner) + $C_RESET)
       $leftContent.Add((' ' * $mainInner))
@@ -863,13 +1127,22 @@ function Render-Frame {
         $leftContent.Add((Fit-Plain $hl $mainInner))
       }
       $leftContent.Add((' ' * $mainInner))
-      foreach ($hl in (Wrap-Plain "[Enter] 下一组  [R] 重练  [F1] 换词库" $mainInner)) {
-        $leftContent.Add("$C_CYAN" + (Fit-Plain $hl $mainInner) + $C_RESET)
+      $finSpecs = [System.Collections.Generic.List[object]]::new()
+      if ($State.Group -lt $State.TotalGroups) { $finSpecs.Add(@{ text = '[Enter 下一组]'; action = 'next-group'; color = $C_CYAN }) }
+      $finSpecs.Add(@{ text = '[R 重练]';    action = 'replay-group'; color = $C_CYAN })
+      $finSpecs.Add(@{ text = '[F1 换词库]'; action = 'open-deck';    color = $C_CYAN })
+    }
+    $finRows = Format-ActionBtnRows $finSpecs $mainInner
+    foreach ($fr in $finRows) {
+      $rIdx = $leftContent.Count
+      $leftContent.Add($fr.text)
+      foreach ($hb in $fr.hitboxes) {
+        $leftHitboxes.Add(@{ row = $rIdx; x1 = 3 + $hb.xOff; x2 = 3 + $hb.xOff + $hb.width - 1; action = $hb.action })
       }
     }
   } elseif ($State.Items.Count -gt 0) {
     $item = $State.Items[$State.Index]
-    $show = (-not $State.Dictation) -or $State.Peek
+    $show = (-not $isMistakeDeck) -and ((-not $State.Dictation) -or $State.Peek)
 
     # 进度条（纯 ASCII 1列宽，自适应窄屏）
     $barW = if ($mainInner -lt 48) { [Math]::Max(6, [Math]::Min(12, $mainInner - 28)) } else { [Math]::Min(24, [Math]::Max(10, $mainInner - 42)) }
@@ -886,24 +1159,32 @@ function Render-Frame {
     }
     if ($contentH -ge 8) { $leftContent.Add((' ' * $mainInner)) }
 
-    # 目标词/句（带增量高亮与自动换行）
+    # 目标词/句（带增量高亮与自动换行，点击可重听发音）
     $tLines = Build-TargetLines $item $mainInner $show
-    foreach ($tl in $tLines) { $leftContent.Add($tl) }
+    foreach ($tl in $tLines) {
+      $rIdx = $leftContent.Count
+      $leftContent.Add($tl)
+      $leftHitboxes.Add(@{ row = $rIdx; x1 = 3; x2 = $mainW - 2; action = 'speak' })
+    }
     if ($contentH -ge 7) { $leftContent.Add((' ' * $mainInner)) }
 
     if ($item.phonetic) {
       foreach ($pl in (Wrap-Plain $item.phonetic $mainInner)) {
+        $rIdx = $leftContent.Count
         $leftContent.Add("$C_DIM" + (Fit-Plain $pl $mainInner) + $C_RESET)
+        $leftHitboxes.Add(@{ row = $rIdx; x1 = 3; x2 = $mainW - 2; action = 'speak' })
       }
     }
     foreach ($ml in (Wrap-Plain $item.meaning $mainInner)) {
+      $rIdx = $leftContent.Count
       $leftContent.Add("$C_YELLOW" + (Fit-Plain $ml $mainInner) + $C_RESET)
+      $leftHitboxes.Add(@{ row = $rIdx; x1 = 3; x2 = $mainW - 2; action = 'speak' })
     }
 
     if ($leftContent.Count + 3 -le $contentH) {
       $leftContent.Add((' ' * $mainInner))
       $prevMeaning = if ($State.Index -gt 0) { if ($State.Items[$State.Index - 1].meaning) { $State.Items[$State.Index - 1].meaning } else { '暂无释义' } } else { '（已是第一条）' }
-      $nextMeaning = if ($State.Index + 1 -lt $State.Items.Count) { if ($State.Items[$State.Index + 1].meaning) { $State.Items[$State.Index + 1].meaning } else { '暂无释义' } } else { '（本组最后一条）' }
+      $nextMeaning = if ($State.Index + 1 -lt $State.Items.Count) { if ($State.Items[$State.Index + 1].meaning) { $State.Items[$State.Index + 1].meaning } else { '暂无释义' } } else { if ($isMistakeDeck) { '（完成将进入下一轮）' } else { '（本组最后一条）' } }
       $prevTxt = "上一条：$prevMeaning"
       $nextTxt = "下一条：$nextMeaning"
       $leftContent.Add("$C_DIM" + (Fit-Plain $prevTxt $mainInner) + $C_RESET)
@@ -915,6 +1196,12 @@ function Render-Frame {
     }
   }
 
+  foreach ($lhb in $leftHitboxes) {
+    if ($lhb.row -ge 0 -and $lhb.row -lt $contentH) {
+      $script:Hitboxes.Add(@{ y = $bodyStartIdx + 2 + $lhb.row; x1 = $lhb.x1; x2 = $lhb.x2; action = $lhb.action; value = $lhb.value })
+    }
+  }
+
   for ($i = 0; $i -lt $contentH; $i++) {
     $rowTxt = if ($i -lt $leftContent.Count) { $leftContent[$i] } else { ' ' * $mainInner }
     $leftBuf.Add("$C_BORDER│$C_RESET $rowTxt $C_BORDER│$C_RESET")
@@ -922,9 +1209,9 @@ function Render-Frame {
   $leftBuf.Add("$C_BORDER╰" + ('─' * ($mainW - 2)) + "╯$C_RESET")
 
   if ($hasSide) {
-    # 预构建右栏：本组词汇队列（可鼠标点击跳词）
+    # 预构建右栏：本组词汇队列（可鼠标点击跳词；错题本模式全遮蔽防泄题）
     $rightBuf = [System.Collections.Generic.List[string]]::new()
-    $sideTitle = ' 本组队列 '
+    $sideTitle = if ($isMistakeDeck) { ' 待清错题 ' } else { ' 本组队列 ' }
     $rtPad = '─' * [Math]::Max(0, $sideW - 3 - (Get-DisplayWidth $sideTitle))
     $rightBuf.Add("$C_BORDER╭─$C_YELLOW$C_BOLD$sideTitle$C_RESET$C_BORDER$rtPad╮$C_RESET")
 
@@ -937,7 +1224,9 @@ function Render-Frame {
       if ($qi -lt $State.Items.Count) {
         $qItem = $State.Items[$qi]
         $qIcon = if ($qi -eq $State.Index) { '>' } elseif ($State.DoneSet.ContainsKey($qi)) { '+' } else { '.' }
-        $qLabel = if ($State.Dictation -and $qi -ge $State.Index -and -not $State.DoneSet.ContainsKey($qi)) {
+        $qLabel = if ($isMistakeDeck) {
+          "$qIcon [错题 #$($qi + 1)]"
+        } elseif ($State.Dictation -and $qi -ge $State.Index -and -not $State.DoneSet.ContainsKey($qi)) {
           "$qIcon [听写 #$($qi + 1)]"
         } else {
           "$qIcon $($qItem.target)"
@@ -1023,9 +1312,26 @@ function Open-ListOverlay([string]$kind) {
 }
 
 function Handle-Action([string]$action, $val = $null) {
+  $isMistakeDeck = ($State.DeckId -eq 'mistakes')
   switch ($action) {
     'open-deck'  { Open-ListOverlay 'deck' }
-    'open-group' { Open-ListOverlay 'group' }
+    'open-group' {
+      if ($isMistakeDeck) {
+        $State.Overlay = 'none'
+        $State.StatusMsg = "错题本共 $($Persisted.mistakes.Count) 条 · 第 $($State.MistakeRound) 轮循环（全部移出为止，按 F1 可换词库）"
+      } else {
+        Open-ListOverlay 'group'
+      }
+    }
+    'close-overlay' {
+      $State.Overlay = 'none'
+      $State.ConfirmClearMistakes = $false
+    }
+    'confirm-overlay-input' {
+      if ($State.Overlay -eq 'input-file' -or $State.Overlay -eq 'input-ai') {
+        $null = Invoke-OverlayPromptConfirm
+      }
+    }
     'open-mistakes' {
       if ($State.Overlay -eq 'mistakes') {
         $State.Overlay = 'none'
@@ -1038,7 +1344,7 @@ function Handle-Action([string]$action, $val = $null) {
         $State.StatusMsg = if ($Persisted.mistakes.Count -eq 0) {
           '错题本目前为空（听写模式下单条敲错超过 3 次自动收录）'
         } else {
-          "错题本共 $($Persisted.mistakes.Count) 条 · Up/Down 查看 | Enter 练习 | D 移除"
+          "错题本共 $($Persisted.mistakes.Count) 条 · Up/Down/点击查看 | Enter 循环听写 | D 移出"
         }
       }
     }
@@ -1053,16 +1359,7 @@ function Handle-Action([string]$action, $val = $null) {
       if ($Persisted.mistakes.Count -eq 0) {
         $State.StatusMsg = '错题本目前为空'
       } else {
-        $selIdx = [Math]::Max(0, [Math]::Min($Persisted.mistakes.Count - 1, $State.CursorIdx))
-        $State.Overlay = 'none'
-        $State.ConfirmClearMistakes = $false
-        $State.DeckId = 'mistakes'
-        $State.Title = '我的错题本'
-        $gNum = [int][Math]::Floor($selIdx / $Size) + 1
-        Set-Group $gNum
-        $localIdx = $selIdx % $Size
-        if ($localIdx -ge 0 -and $localIdx -lt $State.Items.Count) { $State.Index = $localIdx }
-        $State.StatusMsg = "错题本练习（共 $($Persisted.mistakes.Count) 条 · 整条无误输入将自动移除）"
+        Start-MistakePractice $State.CursorIdx
         if ($State.Items.Count -gt 0) { Speak-Text $State.Items[$State.Index].target }
       }
     }
@@ -1081,10 +1378,10 @@ function Handle-Action([string]$action, $val = $null) {
           if ($State.CursorIdx -ge $Persisted.mistakes.Count) {
             $State.CursorIdx = [Math]::Max(0, $Persisted.mistakes.Count - 1)
           }
-          if ($State.DeckId -eq 'mistakes') {
+          if ($isMistakeDeck) {
             Sync-MistakeDeckItems
             if ($State.Items.Count -gt 0 -and $State.Index -ge $State.Items.Count) {
-              $State.Index = $State.Items.Count - 1
+              $State.Index = 0
             }
           }
           $State.StatusMsg = "已从错题本移除「$removedTarget」（剩余 $($Persisted.mistakes.Count) 条）"
@@ -1102,18 +1399,24 @@ function Handle-Action([string]$action, $val = $null) {
         $State.ConfirmClearMistakes = $false
         $State.CursorIdx = 0
         $State.ScrollTop = 0
-        if ($State.DeckId -eq 'mistakes') { Sync-MistakeDeckItems }
+        if ($isMistakeDeck) { Sync-MistakeDeckItems }
         $State.StatusMsg = '已清空全部错题'
       }
     }
     'open-file' { $State.Overlay = 'input-file'; $State.PromptBuf = '' }
     'open-ai'   { $State.Overlay = 'input-ai';   $State.PromptBuf = '' }
     'toggle-mode' {
-      $State.Dictation = -not $State.Dictation
-      $State.Peek = $false
-      $State.WordErrors = 0
-      $State.WordWrong = $false
-      $State.StatusMsg = "已切换为$(if ($State.Dictation) { '听写模式' } else { '跟打模式' })"
+      if ($isMistakeDeck) {
+        $State.Dictation = $true
+        $State.Peek = $false
+        $State.StatusMsg = '错题本仅支持听写模式，无法切换跟打'
+      } else {
+        $State.Dictation = -not $State.Dictation
+        $State.Peek = $false
+        $State.WordErrors = 0
+        $State.WordWrong = $false
+        $State.StatusMsg = "已切换为$(if ($State.Dictation) { '听写模式' } else { '跟打模式' })"
+      }
     }
     'toggle-sound' {
       $script:SoundOn = -not $script:SoundOn
@@ -1131,6 +1434,7 @@ function Handle-Action([string]$action, $val = $null) {
         }
         $State.Items = $shuf
         $State.Index = 0; $State.Typed = ''; $State.HasError = $false; $State.WordWrong = $false; $State.WordErrors = 0; $State.Peek = $false; $State.DoneSet = @{}
+        if ($isMistakeDeck) { $State.Dictation = $true }
         $State.StatusMsg = '已随机打乱本组顺序'
         Speak-Text $State.Items[0].target
       }
@@ -1147,7 +1451,20 @@ function Handle-Action([string]$action, $val = $null) {
       $State.StatusMsg = "已切换到第 $($State.Group) 组"
       if ($State.Items.Count -gt 0) { Speak-Text $State.Items[0].target }
     }
+    'next-group' {
+      if ($State.Finished -and -not $isMistakeDeck -and $State.Group -lt $State.TotalGroups) {
+        Set-Group ($State.Group + 1)
+        if ($State.Items.Count -gt 0) { Speak-Text $State.Items[0].target }
+      }
+    }
+    'replay-group' {
+      if ($State.Finished) {
+        if ($isMistakeDeck) { Start-MistakePractice 0 } else { Set-Group $State.Group }
+        if ($State.Items.Count -gt 0) { Speak-Text $State.Items[0].target }
+      }
+    }
     'jump-word' {
+      $State.Overlay = 'none'
       $qi = [int]$val
       if ($qi -ge 0 -and $qi -lt $State.Items.Count) {
         $State.Index = $qi; $State.Typed = ''; $State.HasError = $false; $State.WordWrong = $false; $State.WordErrors = 0; $State.Peek = $false
@@ -1155,17 +1472,36 @@ function Handle-Action([string]$action, $val = $null) {
       }
     }
     'speak' { if ($State.Items.Count -gt 0) { Speak-Text $State.Items[$State.Index].target } }
-    'peek'  { $State.Peek = -not $State.Peek }
+    'peek' {
+      if ($isMistakeDeck) {
+        $State.Peek = $false
+        $State.StatusMsg = '错题本模式下不支持 Tab 显示答案'
+      } else {
+        $State.Peek = -not $State.Peek
+      }
+    }
     'prev-word' {
-      if ($State.Index -gt 0) {
-        $State.Index--; $State.Typed = ''; $State.HasError = $false; $State.WordWrong = $false; $State.WordErrors = 0; $State.Peek = $false
-        Speak-Text $State.Items[$State.Index].target
+      if ($State.Items.Count -gt 0) {
+        if ($State.Index -gt 0) {
+          $State.Index--; $State.Typed = ''; $State.HasError = $false; $State.WordWrong = $false; $State.WordErrors = 0; $State.Peek = $false
+          Speak-Text $State.Items[$State.Index].target
+        } elseif ($isMistakeDeck) {
+          $State.Index = $State.Items.Count - 1; $State.Typed = ''; $State.HasError = $false; $State.WordWrong = $false; $State.WordErrors = 0; $State.Peek = $false
+          Speak-Text $State.Items[$State.Index].target
+        }
       }
     }
     'next-word' {
-      if ($State.Index + 1 -lt $State.Items.Count) {
-        $State.Index++; $State.Typed = ''; $State.HasError = $false; $State.WordWrong = $false; $State.WordErrors = 0; $State.Peek = $false
-        Speak-Text $State.Items[$State.Index].target
+      if ($State.Items.Count -gt 0) {
+        if ($State.Index + 1 -lt $State.Items.Count) {
+          $State.Index++; $State.Typed = ''; $State.HasError = $false; $State.WordWrong = $false; $State.WordErrors = 0; $State.Peek = $false
+          Speak-Text $State.Items[$State.Index].target
+        } elseif ($isMistakeDeck) {
+          $State.MistakeRound++
+          $State.Index = 0; $State.DoneSet = @{}; $State.Typed = ''; $State.HasError = $false; $State.WordWrong = $false; $State.WordErrors = 0; $State.Peek = $false
+          $State.StatusMsg = "进入第 $($State.MistakeRound) 轮错题循环（剩余 $($Persisted.mistakes.Count) 条）"
+          Speak-Text $State.Items[0].target
+        }
       }
     }
     'exit' { return $true }
@@ -1173,7 +1509,262 @@ function Handle-Action([string]$action, $val = $null) {
   return $false
 }
 
+function Invoke-OverlayPromptConfirm {
+  $val = $State.PromptBuf.Trim()
+  $modeOverlay = $State.Overlay
+  $State.Overlay = 'none'
+  if (-not $val) { return $false }
+  try {
+    if ($modeOverlay -eq 'input-file') {
+      $entries = Parse-TextToEntries (Get-Content (Resolve-Path $val) -Raw -Encoding UTF8)
+      $State.Entries = $entries; $State.Title = Split-Path $val -Leaf; $State.DeckId = 'custom'
+      Set-Group 1
+      $State.StatusMsg = "已导入 $($entries.Count) 条自定义内容"
+    } else {
+      $State.StatusMsg = "正在调用 AI 生成「$val」…"; Render-Frame
+      $entries = Invoke-AiDeck $val
+      $State.Entries = $entries; $State.Title = "AI:$val"; $State.DeckId = 'ai'
+      Set-Group 1
+      $State.StatusMsg = "AI 已生成 $($entries.Count) 条「$val」词库"
+    }
+    if ($State.Items.Count -gt 0) { Speak-Text $State.Items[0].target }
+  } catch {
+    $State.StatusMsg = "失败：$($_.Exception.Message)"
+  }
+  return $true
+}
+
+function Invoke-TypingChar([char]$ch, [switch]$NoUiSleep) {
+  if ([char]::IsControl($ch)) { return }
+  if ($State.Overlay -ne 'none' -or $State.Finished -or $State.Items.Count -eq 0) { return }
+
+  $isMistakeDeck = ($State.DeckId -eq 'mistakes')
+  $item = $State.Items[$State.Index]
+  $target = $item.target
+
+  if ($null -eq $State.StartTime) { $State.StartTime = Get-Date }
+  $expected = if ($State.Typed.Length -lt $target.Length) { $target[$State.Typed.Length] } else { $null }
+  $State.TotalKeys++
+
+  if ($null -ne $expected -and ([string]$ch).ToLowerInvariant() -eq ([string]$expected).ToLowerInvariant()) {
+    $State.Typed += $expected
+    $rest = $target.Substring($State.Typed.Length)
+    if ($rest -and $rest -match '^[.!?,;:''"()]+$') { $State.Typed = $target }
+    $State.HasError = $false
+    $State.CorrectKeys++
+
+    if ($State.Typed.Length -eq $target.Length) {
+      $State.Streak++
+      if ($State.Streak -gt $State.MaxStreak) { $State.MaxStreak = $State.Streak }
+
+      if ($isMistakeDeck) {
+        if ($State.WordErrors -eq 0) {
+          $null = Remove-Mistake $item.target
+          Sync-MistakeDeckItems
+          $newDone = @{}
+          foreach ($k in $State.DoneSet.Keys) {
+            if ($k -lt $State.Index) { $newDone[$k] = $true }
+            elseif ($k -gt $State.Index) { $newDone[$k - 1] = $true }
+          }
+          $State.DoneSet = $newDone
+          $State.Typed = ''
+          $State.HasError = $false
+          $State.Peek = $false
+          $State.WordWrong = $false
+          $State.WordErrors = 0
+          if ($Persisted.mistakes.Count -eq 0) {
+            $State.Finished = $true
+            $State.StatusMsg = '恭喜！错题本已全部答对并清空！'
+            Render-Frame
+          } elseif ($State.Index -ge $State.Items.Count) {
+            $State.MistakeRound++
+            $State.Index = 0
+            $State.DoneSet = @{}
+            $State.Finished = $false
+            $State.StatusMsg = "输入无误已移出！进入第 $($State.MistakeRound) 轮错题循环（剩余 $($Persisted.mistakes.Count) 条）"
+            Render-Frame
+            Speak-Text $State.Items[0].target
+          } else {
+            $State.StatusMsg = "输入无误，已移出错题本（剩余 $($Persisted.mistakes.Count) 条 · 第 $($State.MistakeRound) 轮）"
+            Render-Frame
+            Speak-Text $State.Items[$State.Index].target
+          }
+        } else {
+          $State.Typed = ''
+          $State.HasError = $false
+          $State.Peek = $false
+          $State.WordWrong = $false
+          $State.WordErrors = 0
+          $State.Index++
+          if ($State.Index -ge $State.Items.Count) {
+            Sync-MistakeDeckItems
+            $State.MistakeRound++
+            $State.Index = 0
+            $State.DoneSet = @{}
+            $State.Finished = $false
+            $State.StatusMsg = "本轮有误未移出，进入第 $($State.MistakeRound) 轮错题循环（剩余 $($Persisted.mistakes.Count) 条）"
+          } else {
+            $State.StatusMsg = "本条有误未移出，继续下一条（剩余 $($Persisted.mistakes.Count) 条）"
+          }
+          Render-Frame
+          if ($State.Items.Count -gt 0) { Speak-Text $State.Items[$State.Index].target }
+        }
+      } else {
+        $State.DoneSet[$State.Index] = $true
+        Render-Frame
+        if ($State.Index + 1 -ge $State.Items.Count) {
+          $State.Finished = $true; Render-Frame
+        } else {
+          if (-not $NoUiSleep) { Start-Sleep -Milliseconds 100 }
+          $State.Index++; $State.Typed = ''; $State.Peek = $false; $State.WordWrong = $false; $State.WordErrors = 0
+          Render-Frame
+          Speak-Text $State.Items[$State.Index].target
+        }
+      }
+    } else {
+      Render-Frame
+    }
+  } else {
+    $State.Streak = 0
+    $State.WordErrors++
+    if ($isMistakeDeck) {
+      # 错题本严禁出现 1 次错误：本次错 1 次立刻记录并跳过进入下一词，循环往复直到全部无误移出
+      $null = Add-Mistake $item
+      $State.Typed = ''
+      $State.HasError = $false
+      $State.Peek = $false
+      $State.WordWrong = $false
+      $State.WordErrors = 0
+      $State.Index++
+      if ($State.Index -ge $State.Items.Count) {
+        Sync-MistakeDeckItems
+        if ($State.Items.Count -eq 0) {
+          $State.Finished = $true
+          $State.StatusMsg = '错题本目前为空'
+        } else {
+          $State.MistakeRound++
+          $State.Index = 0
+          $State.DoneSet = @{}
+          $State.Finished = $false
+          $State.StatusMsg = "拼写出错！已跳过本词，进入第 $($State.MistakeRound) 轮错题循环（剩余 $($Persisted.mistakes.Count) 条）"
+        }
+      } else {
+        $State.StatusMsg = "拼写出错（0错才可移出）！已跳过本词，请听写下一条（剩余 $($Persisted.mistakes.Count) 条）"
+      }
+      try { [Console]::Beep(400, 50) } catch {}
+      Render-Frame
+      if (-not $State.Finished -and $State.Items.Count -gt 0) { Speak-Text $State.Items[$State.Index].target }
+      return
+    }
+
+    $State.HasError = $true
+    if ($State.Dictation) {
+      if ($State.WordErrors -gt 3) {
+        if (-not $State.WordWrong) {
+          $State.WordWrong = $true
+          $addRes = Add-Mistake $item
+          $State.StatusMsg = if ($addRes -eq 'updated') { "本词累计敲错 $($State.WordErrors) 次（已在错题本中）" } else { "本词敲错超过 3 次（第 $($State.WordErrors) 次），已加入错题本" }
+        } else {
+          $State.StatusMsg = "本词累计敲错 $($State.WordErrors) 次，已加入错题本"
+        }
+      } else {
+        $State.StatusMsg = "拼写有误（本词第 $($State.WordErrors)/3 次，超过 3 次加入错题本）"
+      }
+    } else {
+      $State.StatusMsg = '拼写有误，请继续'
+    }
+    try { [Console]::Beep(400, 50) } catch {}
+    Render-Frame
+  }
+}
+
+$script:UseWinConsole = $false
+$script:MouseLeftDown = $false
+
+function Resolve-VtSequence([string]$s) {
+  if ($s -match '^\[<(\d+);(\d+);(\d+)([Mm])$') {
+    return @{ kind = 'mouse'; btn = [int]$Matches[1]; x = [int]$Matches[2]; y = [int]$Matches[3]; type = $Matches[4] }
+  }
+  $vtMap = @{
+    'OP' = [ConsoleKey]::F1; '[11~' = [ConsoleKey]::F1
+    'OQ' = [ConsoleKey]::F2; '[12~' = [ConsoleKey]::F2
+    'OR' = [ConsoleKey]::F3; '[13~' = [ConsoleKey]::F3
+    'OS' = [ConsoleKey]::F4; '[14~' = [ConsoleKey]::F4
+    '[15~' = [ConsoleKey]::F5
+    '[17~' = [ConsoleKey]::F6
+    '[A' = [ConsoleKey]::UpArrow;   'OA' = [ConsoleKey]::UpArrow
+    '[B' = [ConsoleKey]::DownArrow; 'OB' = [ConsoleKey]::DownArrow
+    '[C' = [ConsoleKey]::RightArrow;'OC' = [ConsoleKey]::RightArrow
+    '[D' = [ConsoleKey]::LeftArrow; 'OD' = [ConsoleKey]::LeftArrow
+    '[5~' = [ConsoleKey]::PageUp;  '[6~' = [ConsoleKey]::PageDown
+    '[3~' = [ConsoleKey]::Delete
+  }
+  if ($vtMap.ContainsKey($s)) {
+    return @{ kind = 'key'; info = [System.ConsoleKeyInfo]::new([char]0, $vtMap[$s], $false, $false, $false) }
+  }
+  return @{ kind = 'ignore' }
+}
+
 function Read-InputEvent {
+  if ($script:UseWinConsole) {
+    $rec = New-Object YxInputRecord
+    while ($true) {
+      if (-not [WinConsole]::ReadNext([ref]$rec)) { return @{ kind = 'ignore' } }
+      if ($rec.EventType -eq 1) {
+        $ke = $rec.KeyEvent
+        if ($ke.bKeyDown -eq 0) { continue }
+        $vk = [int]$ke.wVirtualKeyCode
+        $uc = [char]$ke.UnicodeChar
+        if ([int]$uc -eq 0 -and ($vk -in @(0x10, 0x11, 0x12, 0x14, 0x5B, 0x5C, 0x5D, 0x90, 0x91))) { continue }
+        $ctl = [uint32]$ke.dwControlKeyState
+        $shift = ($ctl -band 0x0010) -ne 0
+        $alt = ($ctl -band 0x0003) -ne 0
+        $ctrl = (($ctl -band 0x000C) -ne 0) -and (-not $alt)
+
+        if ($vk -eq 0x1B -and [int]$uc -eq 27) {
+          [char]$pch = [char]0
+          if ([WinConsole]::PeekKeyChar([ref]$pch) -and ($pch -eq '[' -or $pch -eq 'O')) {
+            $seq = [System.Text.StringBuilder]::new()
+            while ([WinConsole]::PeekKeyChar([ref]$pch)) {
+              $r2 = New-Object YxInputRecord
+              if (-not [WinConsole]::ReadNext([ref]$r2)) { break }
+              if ($r2.EventType -ne 1 -or $r2.KeyEvent.bKeyDown -eq 0) { continue }
+              $c2 = [char]$r2.KeyEvent.UnicodeChar
+              if ([int]$c2 -eq 0) { continue }
+              [void]$seq.Append($c2)
+              if ($c2 -eq 'M' -or $c2 -eq 'm' -or $c2 -eq '~' -or ($seq.Length -eq 2 -and $seq[0] -eq 'O')) { break }
+            }
+            return (Resolve-VtSequence $seq.ToString())
+          }
+        }
+        $safeVk = if ($vk -ge 0 -and $vk -le 255) { [ConsoleKey]$vk } else { [ConsoleKey]::None }
+        return @{ kind = 'key'; info = [System.ConsoleKeyInfo]::new($uc, $safeVk, $shift, $alt, $ctrl) }
+      } elseif ($rec.EventType -eq 2) {
+        $me = $rec.MouseEvent
+        $flags = [uint32]$me.dwEventFlags
+        [int]$wl = 0; [int]$wt = 0
+        [WinConsole]::GetWindowOrigin([ref]$wl, [ref]$wt)
+        $vpX = [int]$me.dwMousePosition.X - $wl + 1
+        $vpY = [int]$me.dwMousePosition.Y - $wt + 1
+        $leftNow = ([uint32]$me.dwButtonState -band 1) -ne 0
+        if ($flags -eq 0 -or $flags -eq 2) {
+          $wasDown = $script:MouseLeftDown
+          $script:MouseLeftDown = $leftNow
+          if ($leftNow -and (-not $wasDown -or $flags -eq 2)) {
+            return @{ kind = 'mouse'; btn = 0; x = $vpX; y = $vpY; type = 'M' }
+          }
+        } elseif ($flags -eq 4) {
+          $delta = [int16]([uint32]$me.dwButtonState -shr 16)
+          $wBtn = if ($delta -gt 0) { 64 } else { 65 }
+          return @{ kind = 'mouse'; btn = $wBtn; x = $vpX; y = $vpY; type = 'M' }
+        }
+        continue
+      } elseif ($rec.EventType -eq 4) {
+        return @{ kind = 'resize' }
+      }
+    }
+  }
+
   $k = [Console]::ReadKey($true)
   if ($k.Key -eq [ConsoleKey]::Escape -and [Console]::KeyAvailable) {
     $seq = [System.Text.StringBuilder]::new()
@@ -1182,28 +1773,23 @@ function Read-InputEvent {
       [void]$seq.Append($next.KeyChar)
       if ($next.KeyChar -eq 'M' -or $next.KeyChar -eq 'm' -or $next.KeyChar -eq '~' -or ($seq.Length -eq 2 -and $seq[0] -eq 'O')) { break }
     }
-    $s = $seq.ToString()
-    if ($s -match '^\[<(\d+);(\d+);(\d+)([Mm])$') {
-      return @{ kind = 'mouse'; btn = [int]$Matches[1]; x = [int]$Matches[2]; y = [int]$Matches[3]; type = $Matches[4] }
-    }
-    $vtMap = @{
-      'OP' = [ConsoleKey]::F1; '[11~' = [ConsoleKey]::F1
-      'OQ' = [ConsoleKey]::F2; '[12~' = [ConsoleKey]::F2
-      'OR' = [ConsoleKey]::F3; '[13~' = [ConsoleKey]::F3
-      'OS' = [ConsoleKey]::F4; '[14~' = [ConsoleKey]::F4
-      '[15~' = [ConsoleKey]::F5
-      '[17~' = [ConsoleKey]::F6
-    }
-    if ($vtMap.ContainsKey($s)) {
-      return @{ kind = 'key'; info = [System.ConsoleKeyInfo]::new([char]0, $vtMap[$s], $false, $false, $false) }
-    }
-    return @{ kind = 'ignore' }
+    return (Resolve-VtSequence $seq.ToString())
   }
   return @{ kind = 'key'; info = $k }
 }
 
 # ── 主循环 ──
+$origTreatCtrlC = $false
+$hasTreatCtrlC = $false
 try {
+  try {
+    $origTreatCtrlC = [Console]::TreatControlCAsInput
+    [Console]::TreatControlCAsInput = $true
+    $hasTreatCtrlC = $true
+  } catch {}
+  if ('WinConsole' -as [type]) {
+    $script:UseWinConsole = [bool]([WinConsole]::InitMouse())
+  }
   [Console]::Write("$E[?1049h$E[?25l$E[?7l$E[?1000h$E[?1006h")
   Render-Frame
   if ($State.Items.Count -gt 0) { Speak-Text $State.Items[0].target }
@@ -1211,8 +1797,29 @@ try {
   while ($true) {
     $ev = Read-InputEvent
     if ($ev.kind -eq 'ignore') { continue }
+    if ($ev.kind -eq 'resize') {
+      $script:PrevLines.Clear()
+      Render-Frame
+      continue
+    }
 
     if ($ev.kind -eq 'mouse') {
+      if ($ev.type -eq 'M' -and ($ev.btn -eq 64 -or $ev.btn -eq 65)) {
+        $dir = if ($ev.btn -eq 64) { -1 } else { 1 }
+        if ($State.Overlay -eq 'list' -and $State.ListItems.Count -gt 0) {
+          $State.CursorIdx = [Math]::Max(0, [Math]::Min($State.ListItems.Count - 1, $State.CursorIdx + $dir))
+          Render-Frame
+        } elseif ($State.Overlay -eq 'mistakes' -and $Persisted.mistakes.Count -gt 0) {
+          $State.CursorIdx = [Math]::Max(0, [Math]::Min($Persisted.mistakes.Count - 1, $State.CursorIdx + $dir))
+          $State.ConfirmClearMistakes = $false
+          Render-Frame
+        } elseif ($State.Overlay -eq 'none' -and -not $State.Finished -and $State.Items.Count -gt 0) {
+          $act = if ($dir -lt 0) { 'prev-word' } else { 'next-word' }
+          $null = Handle-Action $act
+          Render-Frame
+        }
+        continue
+      }
       if ($ev.type -eq 'M' -and $ev.btn -eq 0) {
         foreach ($hb in $script:Hitboxes) {
           if ($ev.y -eq $hb.y -and $ev.x -ge $hb.x1 -and $ev.x -le $hb.x2) {
@@ -1230,35 +1837,19 @@ try {
 
     if ($isCtrl -and $ki.Key -eq [ConsoleKey]::C) { return }
     if ($ki.Key -eq [ConsoleKey]::Escape) {
-      if ($State.Overlay -ne 'none') { $State.Overlay = 'none'; Render-Frame; continue }
+      if ($State.Overlay -ne 'none') {
+        $State.Overlay = 'none'
+        $State.ConfirmClearMistakes = $false
+        Render-Frame
+        continue
+      }
       return
     }
 
     # 文本输入弹窗（导入文件 / AI 出题）
     if ($State.Overlay -eq 'input-file' -or $State.Overlay -eq 'input-ai') {
       if ($ki.Key -eq [ConsoleKey]::Enter) {
-        $val = $State.PromptBuf.Trim()
-        $modeOverlay = $State.Overlay
-        $State.Overlay = 'none'
-        if ($val) {
-          try {
-            if ($modeOverlay -eq 'input-file') {
-              $entries = Parse-TextToEntries (Get-Content (Resolve-Path $val) -Raw -Encoding UTF8)
-              $State.Entries = $entries; $State.Title = Split-Path $val -Leaf; $State.DeckId = 'custom'
-              Set-Group 1
-              $State.StatusMsg = "已导入 $($entries.Count) 条自定义内容"
-            } else {
-              $State.StatusMsg = "正在调用 AI 生成「$val」…"; Render-Frame
-              $entries = Invoke-AiDeck $val
-              $State.Entries = $entries; $State.Title = "AI:$val"; $State.DeckId = 'ai'
-              Set-Group 1
-              $State.StatusMsg = "AI 已生成 $($entries.Count) 条「$val」词库"
-            }
-            if ($State.Items.Count -gt 0) { Speak-Text $State.Items[0].target }
-          } catch {
-            $State.StatusMsg = "失败：$($_.Exception.Message)"
-          }
-        }
+        $null = Invoke-OverlayPromptConfirm
         Render-Frame
         continue
       }
@@ -1319,20 +1910,16 @@ try {
     }
 
     if ($State.Finished) {
-      if ($State.DeckId -eq 'mistakes' -and $Persisted.mistakes.Count -eq 0) { continue }
+      if ($State.DeckId -eq 'mistakes') { continue }
       if ($ki.Key -eq [ConsoleKey]::Enter -and $State.Group -lt $State.TotalGroups) {
-        Set-Group ($State.Group + 1); Render-Frame
-        if ($State.Items.Count -gt 0) { Speak-Text $State.Items[0].target }
+        $null = Handle-Action 'next-group'; Render-Frame
       } elseif ($ki.Key -eq [ConsoleKey]::R) {
-        Set-Group $State.Group; Render-Frame
-        if ($State.Items.Count -gt 0) { Speak-Text $State.Items[0].target }
+        $null = Handle-Action 'replay-group'; Render-Frame
       }
       continue
     }
 
     if ($State.Items.Count -eq 0) { continue }
-    $item = $State.Items[$State.Index]
-    $target = $item.target
 
     if ($ki.Key -eq [ConsoleKey]::Enter)    { $null = Handle-Action 'speak'; continue }
     if ($ki.Key -eq [ConsoleKey]::Tab)      { $null = Handle-Action 'peek'; Render-Frame; continue }
@@ -1343,101 +1930,10 @@ try {
       $State.HasError = $false; Render-Frame; continue
     }
 
-    $ch = $ki.KeyChar
-    if ([char]::IsControl($ch)) { continue }
-
-    if ($null -eq $State.StartTime) { $State.StartTime = Get-Date }
-    $expected = if ($State.Typed.Length -lt $target.Length) { $target[$State.Typed.Length] } else { $null }
-    $State.TotalKeys++
-
-    if ($null -ne $expected -and ([string]$ch).ToLowerInvariant() -eq ([string]$expected).ToLowerInvariant()) {
-      $State.Typed += $expected
-      $rest = $target.Substring($State.Typed.Length)
-      if ($rest -and $rest -match '^[.!?,;:''"()]+$') { $State.Typed = $target }
-      $State.HasError = $false
-      $State.CorrectKeys++
-
-      if ($State.Typed.Length -eq $target.Length) {
-        $State.Streak++
-        if ($State.Streak -gt $State.MaxStreak) { $State.MaxStreak = $State.Streak }
-
-        if ($State.DeckId -eq 'mistakes' -and $State.WordErrors -eq 0) {
-          $null = Remove-Mistake $item.target
-          Sync-MistakeDeckItems
-          $newDone = @{}
-          foreach ($k in $State.DoneSet.Keys) {
-            if ($k -lt $State.Index) { $newDone[$k] = $true }
-            elseif ($k -gt $State.Index) { $newDone[$k - 1] = $true }
-          }
-          $State.DoneSet = $newDone
-          $State.Typed = ''
-          $State.HasError = $false
-          $State.Peek = $false
-          $State.WordWrong = $false
-          $State.WordErrors = 0
-          if ($Persisted.mistakes.Count -eq 0) {
-            $State.Finished = $true
-            $State.StatusMsg = '恭喜！错题本已全部答对清空'
-            Render-Frame
-          } elseif ($State.Index -ge $State.Items.Count) {
-            $State.Finished = $true
-            $State.StatusMsg = "本组已练习完，当前错题本剩余 $($Persisted.mistakes.Count) 条"
-            Render-Frame
-          } else {
-            $State.StatusMsg = "输入正确！已从错题本移除（剩余 $($Persisted.mistakes.Count) 条）"
-            Render-Frame
-            Speak-Text $State.Items[$State.Index].target
-          }
-        } else {
-          $State.DoneSet[$State.Index] = $true
-          if ($State.DeckId -eq 'mistakes') {
-            $State.StatusMsg = "本条本轮有误敲（$($State.WordErrors) 次），暂保留在错题本"
-          }
-          Render-Frame
-          if ($State.Index + 1 -ge $State.Items.Count) {
-            $State.Finished = $true; Render-Frame
-          } else {
-            Start-Sleep -Milliseconds 100
-            $State.Index++; $State.Typed = ''; $State.Peek = $false; $State.WordWrong = $false; $State.WordErrors = 0
-            Render-Frame
-            Speak-Text $State.Items[$State.Index].target
-          }
-        }
-      } else {
-        Render-Frame
-      }
-    } else {
-      $State.HasError = $true
-      $State.Streak = 0
-      $State.WordErrors++
-      if ($State.Dictation) {
-        if ($State.DeckId -eq 'mistakes') {
-          if ($State.WordErrors -gt 3 -and -not $State.WordWrong) {
-            $State.WordWrong = $true
-            $null = Add-Mistake $item
-          }
-          $State.StatusMsg = "拼写有误（本轮错 $($State.WordErrors) 次，无误敲才移出错题本）"
-        } elseif ($State.WordErrors -gt 3) {
-          if (-not $State.WordWrong) {
-            $State.WordWrong = $true
-            $addRes = Add-Mistake $item
-            $State.StatusMsg = if ($addRes -eq 'updated') { "本词累计敲错 $($State.WordErrors) 次（已在错题本中）" } else { "本词敲错超过 3 次（第 $($State.WordErrors) 次），已加入错题本" }
-          } else {
-            $State.StatusMsg = "本词累计敲错 $($State.WordErrors) 次，已加入错题本"
-          }
-        } else {
-          $State.StatusMsg = "拼写有误（本词第 $($State.WordErrors)/3 次，超过 3 次加入错题本）"
-        }
-      } elseif ($State.DeckId -eq 'mistakes') {
-        $State.StatusMsg = "拼写有误（本轮错 $($State.WordErrors) 次，全对才会移出错题本）"
-      } else {
-        $State.StatusMsg = '拼写有误，请继续'
-      }
-      [Console]::Beep(400, 50)
-      Render-Frame
-    }
+    Invoke-TypingChar $ki.KeyChar
   }
 } finally {
+  if ('WinConsole' -as [type]) { [WinConsole]::Restore() }
+  if ($hasTreatCtrlC) { try { [Console]::TreatControlCAsInput = $origTreatCtrlC } catch {} }
   [Console]::Write("$E[?1006l$E[?1000l$E[?7h$E[?25h$E[?1049l")
 }
-

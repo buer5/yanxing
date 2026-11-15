@@ -5,9 +5,9 @@
 A lightweight, dependency-free Windows terminal TUI for English typing and dictation practice:
 
 -   Responsive two-pane / single-pane workspace (practice card + clickable queue at `>= 80` columns; compact single pane below `80` columns);
--   Typing and Dictation modes (dictation hides English spelling, shows translation-only prev/next previews, adds an item to the mistake book after more than 3 wrong keystrokes without leaking the answer, and removes it once typed accurately in the mistake book);
+-   Typing and Dictation modes (dictation hides English spelling, shows translation-only previews, and records an item into the mistake book after more than 3 wrong keystrokes; inside the mistake book, practice is dictation-only with Tab hint disabled, skips to the next item immediately on any single mistake, and loops continuously across remaining items until every entry is cleared with zero errors);
 -   CJK-exact column width calculation with line-level incremental diff rendering;
--   SGR mouse support for the top bar, bottom bar, overlays, and word queue;
+-   Native console and terminal mouse click and wheel support (automatically disables blocking quick-edit selection) for the top bar, bottom bar, overlays, word card, completion actions, and queue;
 -   14 built-in offline word & sentence decks, local `.txt` import, and OpenAI-compatible AI deck generation.
 
 It ships as a single pure PowerShell script with zero external child processes, using Windows `SAPI.SpVoice` for speech and built-in `winsqlite3.dll` for local SQLite persistence.
