@@ -233,10 +233,28 @@ if ($script:SqliteReady) {
 $Persisted = @{
   book     = 'ket2021'
   group    = 1
-  mistakes = @()
+  mistakes = [System.Collections.Generic.List[object]]::new()
   aiUrl    = 'http://localhost:11434/v1'
   aiKey    = ''
   aiModel  = 'qwen2.5:7b'
+}
+
+function Normalize-Mistakes($rawList) {
+  $list = [System.Collections.Generic.List[object]]::new()
+  if (-not $rawList) { return ,$list }
+  $seen = @{}
+  foreach ($m in $rawList) {
+    $t = [string]$m.target
+    if ([string]::IsNullOrWhiteSpace($t)) { continue }
+    $tNorm = $t.Trim()
+    $key = $tNorm.ToLowerInvariant()
+    if ($seen.ContainsKey($key)) { continue }
+    $seen[$key] = $true
+    $wc = 1
+    try { if ($m.wrongCount -and [int]$m.wrongCount -gt 0) { $wc = [int]$m.wrongCount } } catch { $wc = 1 }
+    $list.Add(@{ target = $tNorm; phonetic = [string]$m.phonetic; meaning = [string]$m.meaning; wrongCount = $wc })
+  }
+  return ,$list
 }
 
 $dbStateRows = Invoke-DbQuery "SELECT value FROM user_setting WHERE setting_key = ?;" @('cli.typing.state')
@@ -250,22 +268,21 @@ if ($rawStateJson) {
     if ($loaded.aiKey)   { $Persisted.aiKey = [string]$loaded.aiKey }
     if ($loaded.aiModel) { $Persisted.aiModel = [string]$loaded.aiModel }
     if ($loaded.mistakes) {
-      $Persisted.mistakes = @($loaded.mistakes | ForEach-Object {
-        @{ target = [string]$_.target; phonetic = [string]$_.phonetic; meaning = [string]$_.meaning }
-      })
+      $Persisted.mistakes = Normalize-Mistakes $loaded.mistakes
     }
   } catch {}
 }
 
 function Save-State {
   try {
+    $mArr = [object[]]$Persisted.mistakes.ToArray()
     $obj = @{
       book     = $Persisted.book
       group    = $Persisted.group
       aiUrl    = $Persisted.aiUrl
       aiKey    = $Persisted.aiKey
       aiModel  = $Persisted.aiModel
-      mistakes = $Persisted.mistakes
+      mistakes = $mArr
     }
     $json = $obj | ConvertTo-Json -Depth 4 -Compress
     $nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
@@ -394,7 +411,7 @@ $State = [ordered]@{
   StartTime   = $null
   Finished    = $false
   StatusMsg   = '就绪 · 直接输入即可开始'
-  Overlay     = 'none'   # 'none' | 'list' | 'input-file' | 'input-ai'
+  Overlay     = 'none'   # 'none' | 'list' | 'mistakes' | 'input-file' | 'input-ai'
   ListKind    = ''       # 'deck' | 'group'
   ListTitle   = ''
   ListHint    = ''
@@ -402,16 +419,55 @@ $State = [ordered]@{
   PromptBuf   = ''
   CursorIdx   = 0
   ScrollTop   = 0
+  ConfirmClearMistakes = $false
+}
+
+function Get-EntrySlice($entries, [int]$s, [int]$e) {
+  $list = [System.Collections.Generic.List[object]]::new()
+  if ($entries -and $entries.Count -gt 0 -and $s -le $e) {
+    for ($idx = $s; $idx -le $e -and $idx -lt $entries.Count; $idx++) {
+      $list.Add($entries[$idx])
+    }
+  }
+  return ,$list
+}
+
+function Sync-MistakeDeckItems {
+  if ($State.DeckId -ne 'mistakes') { return }
+  $entries = [System.Collections.Generic.List[object]]::new()
+  foreach ($m in $Persisted.mistakes) { $entries.Add($m) }
+  $State.Entries = $entries
+  if ($entries.Count -eq 0) {
+    $State.TotalGroups = 1
+    $State.Group = 1
+    $State.Items = [System.Collections.Generic.List[object]]::new()
+    $State.Index = 0
+    $State.Finished = $true
+    return
+  }
+  $total = [Math]::Max(1, [int][Math]::Ceiling($entries.Count / $Size))
+  $safe = [Math]::Max(1, [Math]::Min($total, $State.Group))
+  $s = ($safe - 1) * $Size
+  $e = [Math]::Min($entries.Count - 1, $s + $Size - 1)
+  $State.TotalGroups = $total
+  $State.Group = $safe
+  $State.Items = Get-EntrySlice $entries $s $e
 }
 
 function Set-Group([int]$groupNum) {
-  $total = [Math]::Max(1, [int][Math]::Ceiling($State.Entries.Count / $Size))
+  if ($State.DeckId -eq 'mistakes') {
+    $entries = [System.Collections.Generic.List[object]]::new()
+    foreach ($m in $Persisted.mistakes) { $entries.Add($m) }
+    $State.Entries = $entries
+  }
+  $cnt = if ($State.Entries) { $State.Entries.Count } else { 0 }
+  $total = [Math]::Max(1, [int][Math]::Ceiling($cnt / $Size))
   $safe = [Math]::Max(1, [Math]::Min($total, $groupNum))
   $s = ($safe - 1) * $Size
-  $e = [Math]::Min($State.Entries.Count - 1, $s + $Size - 1)
+  $e = [Math]::Min($cnt - 1, $s + $Size - 1)
   $State.TotalGroups = $total
   $State.Group = $safe
-  $State.Items = if ($s -le $e) { @($State.Entries[$s..$e]) } else { @() }
+  $State.Items = if ($cnt -gt 0) { Get-EntrySlice $State.Entries $s $e } else { [System.Collections.Generic.List[object]]::new() }
   $State.DoneSet = @{}
   $State.Index = 0
   $State.Typed = ''
@@ -423,7 +479,7 @@ function Set-Group([int]$groupNum) {
   $State.TotalKeys = 0
   $State.Streak = 0
   $State.StartTime = $null
-  $State.Finished = $false
+  $State.Finished = ($State.DeckId -eq 'mistakes' -and $cnt -eq 0)
   if ($State.DeckId -ne 'mistakes' -and $State.DeckId -ne 'custom' -and $State.DeckId -ne 'ai') {
     $Persisted.book = $State.DeckId
     $Persisted.group = $State.Group
@@ -442,24 +498,53 @@ function Select-DeckAndGroup([string]$deckId, [int]$groupNum) {
   $State.StatusMsg = "已切换词库：$($meta.name)（共 $($entries.Count) 条）"
 }
 
-function Add-Mistake($item) {
-  $exists = $Persisted.mistakes | Where-Object { $_.target -eq $item.target } | Select-Object -First 1
-  if (-not $exists) {
-    $Persisted.mistakes = @($Persisted.mistakes) + @(@{
-      target = $item.target; phonetic = $item.phonetic; meaning = $item.meaning
-    })
-    Save-State
+function Find-MistakeIndex([string]$target) {
+  $tNorm = if ($target) { $target.Trim().ToLowerInvariant() } else { '' }
+  for ($i = 0; $i -lt $Persisted.mistakes.Count; $i++) {
+    if ([string]$Persisted.mistakes[$i].target -and $Persisted.mistakes[$i].target.Trim().ToLowerInvariant() -eq $tNorm) {
+      return $i
+    }
   }
+  return -1
 }
 
-function Remove-Mistake($item) {
-  $before = @($Persisted.mistakes).Count
-  $Persisted.mistakes = @($Persisted.mistakes | Where-Object { $_.target -ne $item.target })
-  if (@($Persisted.mistakes).Count -lt $before) {
+function Add-Mistake($item) {
+  $tNorm = ([string]$item.target).Trim()
+  if (-not $tNorm) { return 'skip' }
+  $idx = Find-MistakeIndex $tNorm
+  if ($idx -ge 0) {
+    $cur = $Persisted.mistakes[$idx]
+    $wc = 1
+    try { $wc = [int]$cur.wrongCount + 1 } catch { $wc = 2 }
+    $cur.wrongCount = $wc
     Save-State
-    return $true
+    return 'updated'
   }
-  return $false
+  $Persisted.mistakes.Add(@{
+    target = $tNorm; phonetic = [string]$item.phonetic; meaning = [string]$item.meaning; wrongCount = 1
+  })
+  Save-State
+  return 'added'
+}
+
+function Remove-Mistake([string]$target) {
+  $idx = Find-MistakeIndex $target
+  if ($idx -lt 0) { return $false }
+  $Persisted.mistakes.RemoveAt($idx)
+  Save-State
+  return $true
+}
+
+function Remove-MistakeAt([int]$idx) {
+  if ($idx -lt 0 -or $idx -ge $Persisted.mistakes.Count) { return $false }
+  $Persisted.mistakes.RemoveAt($idx)
+  Save-State
+  return $true
+}
+
+function Clear-Mistakes {
+  $Persisted.mistakes.Clear()
+  Save-State
 }
 
 if ($File) {
@@ -623,6 +708,7 @@ function Render-Frame {
   # 预构建左栏内容（固定 $bodyRows 行）
   $leftBuf = [System.Collections.Generic.List[string]]::new()
   $leftTitle = if ($State.Overlay -eq 'list') { " $($State.ListTitle) " }
+               elseif ($State.Overlay -eq 'mistakes') { " 错题本 ($($Persisted.mistakes.Count) 条) " }
                elseif ($State.Overlay -eq 'input-file') { ' 导入本地文本 ' }
                elseif ($State.Overlay -eq 'input-ai') { ' AI 生成词库 ' }
                else { ' 练习区 ' }
@@ -648,6 +734,93 @@ function Render-Frame {
       if ($idx -eq $State.CursorIdx) { $leftContent.Add("$C_BG_SEL$C_BOLD$txt$C_RESET") } else { $leftContent.Add($txt) }
       $script:Hitboxes.Add(@{ y = $bodyStartIdx + 2 + $headCount + $i; x1 = 3; x2 = $mainW - 2; action = $li.action; value = $li.value })
     }
+  } elseif ($State.Overlay -eq 'mistakes') {
+    $mList = $Persisted.mistakes
+    $mCnt = $mList.Count
+    if ($mCnt -eq 0) {
+      foreach ($hl in (Wrap-Plain "错题本目前为空（听写模式下单条敲错超过 3 次自动收录）" $mainInner)) {
+        $leftContent.Add((Fit-Plain $hl $mainInner))
+      }
+      $leftContent.Add((' ' * $mainInner))
+      $leftContent.Add("$C_CYAN" + (Fit-Plain "[Esc / F5] 返回练习" $mainInner) + $C_RESET)
+    } else {
+      if ($State.CursorIdx -ge $mCnt) { $State.CursorIdx = $mCnt - 1 }
+      if ($State.CursorIdx -lt 0) { $State.CursorIdx = 0 }
+      $sel = $mList[$State.CursorIdx]
+      $wc = if ($sel.wrongCount) { [int]$sel.wrongCount } else { 1 }
+
+      foreach ($hl in (Wrap-Plain "Up/Down 选词查看 | Enter 练习 | Space 朗读 | D/Del 移除 | C 清空" $mainInner)) {
+        $leftContent.Add("$C_DIM" + (Fit-Plain $hl $mainInner) + $C_RESET)
+      }
+      $headCount = $leftContent.Count
+
+      # 底部详情区（完整展示当前选中错题的单词、音标与中文释义，绝不遮挡或截断）
+      $detailLines = [System.Collections.Generic.List[string]]::new()
+      $detailLines.Add("$C_BORDER" + ('─' * $mainInner) + $C_RESET)
+      $phPart = if ($sel.phonetic) { "  $($sel.phonetic)" } else { '' }
+      foreach ($dl in (Wrap-Plain "单词：$($sel.target)$phPart  [错${wc}次]" $mainInner)) {
+        $detailLines.Add("$C_GREEN$C_BOLD" + (Fit-Plain $dl $mainInner) + $C_RESET)
+      }
+      $mMean = if ($sel.meaning) { $sel.meaning } else { '暂无释义' }
+      foreach ($dl in (Wrap-Plain "释义：$mMean" $mainInner)) {
+        $detailLines.Add("$C_YELLOW" + (Fit-Plain $dl $mainInner) + $C_RESET)
+      }
+
+      # 详情区可点击操作按钮行
+      $clearLbl = if ($State.ConfirmClearMistakes) { '[再按C确认清空]' } else { '[C 清空]' }
+      $mBtns = @(
+        @{ text = '[Enter 从此词练]'; action = 'practice-mistakes' },
+        @{ text = '[Space 朗读]';     action = 'speak-mistake' },
+        @{ text = '[D 移出]';         action = 'remove-mistake-at' },
+        @{ text = $clearLbl;          action = 'clear-mistakes' }
+      )
+      $mbRowIdx = $contentH - 1
+      $mbSb = [System.Text.StringBuilder]::new()
+      $mbx = 0
+      $pendingMBtns = [System.Collections.Generic.List[object]]::new()
+      foreach ($mb in $mBtns) {
+        $mbw = Get-DisplayWidth $mb.text
+        $sp = if ($mbx -gt 0) { 1 } else { 0 }
+        if ($mbx + $sp + $mbw -gt $mainInner) { break }
+        if ($sp -gt 0) { [void]$mbSb.Append(' '); $mbx++ }
+        $col = if ($mb.action -eq 'clear-mistakes' -and $State.ConfirmClearMistakes) { $C_RED } elseif ($mb.action -eq 'practice-mistakes') { $C_CYAN } else { $C_WHITE }
+        [void]$mbSb.Append("$col$($mb.text)$C_RESET")
+        $pendingMBtns.Add(@{ x1 = 3 + $mbx; x2 = 3 + $mbx + $mbw - 1; action = $mb.action })
+        $mbx += $mbw
+      }
+      if ($mbx -lt $mainInner) { [void]$mbSb.Append(' ' * ($mainInner - $mbx)) }
+      $detailLines.Add($mbSb.ToString())
+
+      $listH = [Math]::Max(1, $contentH - $headCount - $detailLines.Count)
+      $maxShow = [Math]::Min($mCnt, $listH)
+      if ($State.CursorIdx -lt $State.ScrollTop) { $State.ScrollTop = $State.CursorIdx }
+      if ($State.CursorIdx -ge $State.ScrollTop + $maxShow) { $State.ScrollTop = $State.CursorIdx - $maxShow + 1 }
+      for ($i = 0; $i -lt $maxShow; $i++) {
+        $mi = $State.ScrollTop + $i
+        $m = $mList[$mi]
+        $mwc = if ($m.wrongCount) { [int]$m.wrongCount } else { 1 }
+        $rowLabel = "{0,2}. {1} (错{2}次) - {3}" -f ($mi + 1), $m.target, $mwc, $(if ($m.meaning) { $m.meaning } else { '暂无释义' })
+        $txt = Fit-Plain $rowLabel $mainInner
+        if ($mi -eq $State.CursorIdx) { $leftContent.Add("$C_BG_SEL$C_BOLD$txt$C_RESET") } else { $leftContent.Add($txt) }
+        $script:Hitboxes.Add(@{ y = $bodyStartIdx + 2 + $headCount + $i; x1 = 3; x2 = $mainW - 2; action = 'select-mistake'; value = $mi })
+      }
+      while ($leftContent.Count -lt ($contentH - $detailLines.Count)) {
+        $leftContent.Add((' ' * $mainInner))
+      }
+      $btnAdded = $false
+      foreach ($dl in $detailLines) {
+        if ($leftContent.Count -lt $contentH) {
+          $leftContent.Add($dl)
+          if ($dl -eq $detailLines[$detailLines.Count - 1]) { $btnAdded = $true }
+        }
+      }
+      if ($btnAdded) {
+        $btnY = $bodyStartIdx + 2 + ($leftContent.Count - 1)
+        foreach ($pb in $pendingMBtns) {
+          $script:Hitboxes.Add(@{ y = $btnY; x1 = $pb.x1; x2 = $pb.x2; action = $pb.action })
+        }
+      }
+    }
   } elseif ($State.Overlay -eq 'input-file') {
     foreach ($hl in (Wrap-Plain "请输入本地 .txt 路径（支持英文文章或 词|义 行）：" $mainInner)) { $leftContent.Add((Fit-Plain $hl $mainInner)) }
     $leftContent.Add((' ' * $mainInner))
@@ -662,14 +835,37 @@ function Render-Frame {
     $leftContent.Add((' ' * $mainInner))
     foreach ($hl in (Wrap-Plain "Enter 调用 AI 生成  |  Esc 取消" $mainInner)) { $leftContent.Add("$C_DIM" + (Fit-Plain $hl $mainInner) + $C_RESET) }
   } elseif ($State.Finished) {
-    $leftContent.Add("$C_GREEN$C_BOLD" + (Fit-Plain "* 本组练习完成！" $mainInner) + $C_RESET)
-    $leftContent.Add((' ' * $mainInner))
-    foreach ($hl in (Wrap-Plain "完成：$($State.Items.Count) 条 | 正确率：$acc% | 速度：$wpm WPM | 最高连击：$($State.MaxStreak) | 错题：$($Persisted.mistakes.Count)" $mainInner)) {
-      $leftContent.Add((Fit-Plain $hl $mainInner))
-    }
-    $leftContent.Add((' ' * $mainInner))
-    foreach ($hl in (Wrap-Plain "[Enter] 下一组  [R] 重练  [F1] 换词库" $mainInner)) {
-      $leftContent.Add("$C_CYAN" + (Fit-Plain $hl $mainInner) + $C_RESET)
+    if ($State.DeckId -eq 'mistakes' -and $Persisted.mistakes.Count -eq 0) {
+      $leftContent.Add("$C_GREEN$C_BOLD" + (Fit-Plain "* 恭喜！错题本已全部答对并清空！" $mainInner) + $C_RESET)
+      $leftContent.Add((' ' * $mainInner))
+      foreach ($hl in (Wrap-Plain "正确率：$acc% | 速度：$wpm WPM | 最高连击：$($State.MaxStreak)" $mainInner)) {
+        $leftContent.Add((Fit-Plain $hl $mainInner))
+      }
+      $leftContent.Add((' ' * $mainInner))
+      foreach ($hl in (Wrap-Plain "[F1] 切换词库  [F5] 查看错题本  [Esc] 退出" $mainInner)) {
+        $leftContent.Add("$C_CYAN" + (Fit-Plain $hl $mainInner) + $C_RESET)
+      }
+    } elseif ($State.DeckId -eq 'mistakes') {
+      $leftContent.Add("$C_GREEN$C_BOLD" + (Fit-Plain "* 本轮错题练习完成！" $mainInner) + $C_RESET)
+      $leftContent.Add((' ' * $mainInner))
+      foreach ($hl in (Wrap-Plain "错题本仍剩余：$($Persisted.mistakes.Count) 条 | 正确率：$acc% | 速度：$wpm WPM" $mainInner)) {
+        $leftContent.Add((Fit-Plain $hl $mainInner))
+      }
+      $leftContent.Add((' ' * $mainInner))
+      $nextHint = if ($State.Group -lt $State.TotalGroups) { "[Enter] 下一组  [R] 重练剩余错题  [F5] 错题列表  [F1] 换词库" } else { "[R] 重练剩余错题  [F5] 错题列表  [F1] 换词库" }
+      foreach ($hl in (Wrap-Plain $nextHint $mainInner)) {
+        $leftContent.Add("$C_CYAN" + (Fit-Plain $hl $mainInner) + $C_RESET)
+      }
+    } else {
+      $leftContent.Add("$C_GREEN$C_BOLD" + (Fit-Plain "* 本组练习完成！" $mainInner) + $C_RESET)
+      $leftContent.Add((' ' * $mainInner))
+      foreach ($hl in (Wrap-Plain "完成：$($State.Items.Count) 条 | 正确率：$acc% | 速度：$wpm WPM | 最高连击：$($State.MaxStreak) | 错题：$($Persisted.mistakes.Count)" $mainInner)) {
+        $leftContent.Add((Fit-Plain $hl $mainInner))
+      }
+      $leftContent.Add((' ' * $mainInner))
+      foreach ($hl in (Wrap-Plain "[Enter] 下一组  [R] 重练  [F1] 换词库" $mainInner)) {
+        $leftContent.Add("$C_CYAN" + (Fit-Plain $hl $mainInner) + $C_RESET)
+      }
     }
   } elseif ($State.Items.Count -gt 0) {
     $item = $State.Items[$State.Index]
@@ -831,17 +1027,83 @@ function Handle-Action([string]$action, $val = $null) {
     'open-deck'  { Open-ListOverlay 'deck' }
     'open-group' { Open-ListOverlay 'group' }
     'open-mistakes' {
-      if ($Persisted.mistakes.Count -eq 0) {
-        $State.StatusMsg = '错题本目前为空（听写模式下单条敲错超过 3 次自动收录）'
-      } else {
+      if ($State.Overlay -eq 'mistakes') {
         $State.Overlay = 'none'
+        $State.ConfirmClearMistakes = $false
+      } else {
+        $State.Overlay = 'mistakes'
+        $State.CursorIdx = 0
+        $State.ScrollTop = 0
+        $State.ConfirmClearMistakes = $false
+        $State.StatusMsg = if ($Persisted.mistakes.Count -eq 0) {
+          '错题本目前为空（听写模式下单条敲错超过 3 次自动收录）'
+        } else {
+          "错题本共 $($Persisted.mistakes.Count) 条 · Up/Down 查看 | Enter 练习 | D 移除"
+        }
+      }
+    }
+    'select-mistake' {
+      $mi = [int]$val
+      if ($mi -ge 0 -and $mi -lt $Persisted.mistakes.Count) {
+        $State.CursorIdx = $mi
+        $State.ConfirmClearMistakes = $false
+      }
+    }
+    'practice-mistakes' {
+      if ($Persisted.mistakes.Count -eq 0) {
+        $State.StatusMsg = '错题本目前为空'
+      } else {
+        $selIdx = [Math]::Max(0, [Math]::Min($Persisted.mistakes.Count - 1, $State.CursorIdx))
+        $State.Overlay = 'none'
+        $State.ConfirmClearMistakes = $false
         $State.DeckId = 'mistakes'
         $State.Title = '我的错题本'
-        $State.Entries = [System.Collections.Generic.List[object]]::new()
-        foreach ($m in $Persisted.mistakes) { $State.Entries.Add($m) }
-        Set-Group 1
-        $State.StatusMsg = "已进入错题本，共 $($State.Entries.Count) 条（答对自动移除）"
-        if ($State.Items.Count -gt 0) { Speak-Text $State.Items[0].target }
+        $gNum = [int][Math]::Floor($selIdx / $Size) + 1
+        Set-Group $gNum
+        $localIdx = $selIdx % $Size
+        if ($localIdx -ge 0 -and $localIdx -lt $State.Items.Count) { $State.Index = $localIdx }
+        $State.StatusMsg = "错题本练习（共 $($Persisted.mistakes.Count) 条 · 整条无误输入将自动移除）"
+        if ($State.Items.Count -gt 0) { Speak-Text $State.Items[$State.Index].target }
+      }
+    }
+    'speak-mistake' {
+      if ($Persisted.mistakes.Count -gt 0) {
+        $si = [Math]::Max(0, [Math]::Min($Persisted.mistakes.Count - 1, $State.CursorIdx))
+        Speak-Text $Persisted.mistakes[$si].target
+      }
+    }
+    'remove-mistake-at' {
+      if ($Persisted.mistakes.Count -gt 0) {
+        $ri = [Math]::Max(0, [Math]::Min($Persisted.mistakes.Count - 1, $State.CursorIdx))
+        $removedTarget = $Persisted.mistakes[$ri].target
+        if (Remove-MistakeAt $ri) {
+          $State.ConfirmClearMistakes = $false
+          if ($State.CursorIdx -ge $Persisted.mistakes.Count) {
+            $State.CursorIdx = [Math]::Max(0, $Persisted.mistakes.Count - 1)
+          }
+          if ($State.DeckId -eq 'mistakes') {
+            Sync-MistakeDeckItems
+            if ($State.Items.Count -gt 0 -and $State.Index -ge $State.Items.Count) {
+              $State.Index = $State.Items.Count - 1
+            }
+          }
+          $State.StatusMsg = "已从错题本移除「$removedTarget」（剩余 $($Persisted.mistakes.Count) 条）"
+        }
+      }
+    }
+    'clear-mistakes' {
+      if ($Persisted.mistakes.Count -eq 0) {
+        $State.ConfirmClearMistakes = $false
+      } elseif (-not $State.ConfirmClearMistakes) {
+        $State.ConfirmClearMistakes = $true
+        $State.StatusMsg = "确认清空全部 $($Persisted.mistakes.Count) 条错题？再按 C / 点击确认清空"
+      } else {
+        Clear-Mistakes
+        $State.ConfirmClearMistakes = $false
+        $State.CursorIdx = 0
+        $State.ScrollTop = 0
+        if ($State.DeckId -eq 'mistakes') { Sync-MistakeDeckItems }
+        $State.StatusMsg = '已清空全部错题'
       }
     }
     'open-file' { $State.Overlay = 'input-file'; $State.PromptBuf = '' }
@@ -849,6 +1111,8 @@ function Handle-Action([string]$action, $val = $null) {
     'toggle-mode' {
       $State.Dictation = -not $State.Dictation
       $State.Peek = $false
+      $State.WordErrors = 0
+      $State.WordWrong = $false
       $State.StatusMsg = "已切换为$(if ($State.Dictation) { '听写模式' } else { '跟打模式' })"
     }
     'toggle-sound' {
@@ -859,7 +1123,13 @@ function Handle-Action([string]$action, $val = $null) {
     'shuffle' {
       if ($State.Items.Count -gt 1) {
         $rnd = [System.Random]::new()
-        $State.Items = @($State.Items | Sort-Object { $rnd.Next() })
+        $shuf = [System.Collections.Generic.List[object]]::new()
+        foreach ($x in $State.Items) { $shuf.Add($x) }
+        for ($i = $shuf.Count - 1; $i -gt 0; $i--) {
+          $j = $rnd.Next($i + 1)
+          $tmp = $shuf[$i]; $shuf[$i] = $shuf[$j]; $shuf[$j] = $tmp
+        }
+        $State.Items = $shuf
         $State.Index = 0; $State.Typed = ''; $State.HasError = $false; $State.WordWrong = $false; $State.WordErrors = 0; $State.Peek = $false; $State.DoneSet = @{}
         $State.StatusMsg = '已随机打乱本组顺序'
         Speak-Text $State.Items[0].target
@@ -1017,6 +1287,8 @@ try {
       $maxIdx = [Math]::Max(0, $State.ListItems.Count - 1)
       if ($ki.Key -eq [ConsoleKey]::UpArrow -or $ki.Key -eq [ConsoleKey]::LeftArrow) { $State.CursorIdx = [Math]::Max(0, $State.CursorIdx - 1) }
       elseif ($ki.Key -eq [ConsoleKey]::DownArrow -or $ki.Key -eq [ConsoleKey]::RightArrow) { $State.CursorIdx = [Math]::Min($maxIdx, $State.CursorIdx + 1) }
+      elseif ($ki.Key -eq [ConsoleKey]::PageUp)   { $State.CursorIdx = [Math]::Max(0, $State.CursorIdx - 5) }
+      elseif ($ki.Key -eq [ConsoleKey]::PageDown) { $State.CursorIdx = [Math]::Min($maxIdx, $State.CursorIdx + 5) }
       elseif ($ki.Key -eq [ConsoleKey]::Enter -and $State.ListItems.Count -gt 0) {
         $sel = $State.ListItems[$State.CursorIdx]
         $null = Handle-Action $sel.action $sel.value
@@ -1024,7 +1296,30 @@ try {
       Render-Frame; continue
     }
 
+    if ($State.Overlay -eq 'mistakes') {
+      $maxIdx = [Math]::Max(0, $Persisted.mistakes.Count - 1)
+      if ($ki.Key -eq [ConsoleKey]::UpArrow -or $ki.Key -eq [ConsoleKey]::LeftArrow) {
+        $State.CursorIdx = [Math]::Max(0, $State.CursorIdx - 1); $State.ConfirmClearMistakes = $false
+      } elseif ($ki.Key -eq [ConsoleKey]::DownArrow -or $ki.Key -eq [ConsoleKey]::RightArrow) {
+        $State.CursorIdx = [Math]::Min($maxIdx, $State.CursorIdx + 1); $State.ConfirmClearMistakes = $false
+      } elseif ($ki.Key -eq [ConsoleKey]::PageUp) {
+        $State.CursorIdx = [Math]::Max(0, $State.CursorIdx - 5); $State.ConfirmClearMistakes = $false
+      } elseif ($ki.Key -eq [ConsoleKey]::PageDown) {
+        $State.CursorIdx = [Math]::Min($maxIdx, $State.CursorIdx + 5); $State.ConfirmClearMistakes = $false
+      } elseif ($ki.Key -eq [ConsoleKey]::Enter) {
+        $null = Handle-Action 'practice-mistakes'
+      } elseif ($ki.Key -eq [ConsoleKey]::Spacebar -or $ki.Key -eq [ConsoleKey]::S) {
+        $null = Handle-Action 'speak-mistake'
+      } elseif ($ki.Key -eq [ConsoleKey]::Delete -or $ki.Key -eq [ConsoleKey]::Backspace -or $ki.Key -eq [ConsoleKey]::D) {
+        $null = Handle-Action 'remove-mistake-at'
+      } elseif ($ki.Key -eq [ConsoleKey]::C) {
+        $null = Handle-Action 'clear-mistakes'
+      }
+      Render-Frame; continue
+    }
+
     if ($State.Finished) {
+      if ($State.DeckId -eq 'mistakes' -and $Persisted.mistakes.Count -eq 0) { continue }
       if ($ki.Key -eq [ConsoleKey]::Enter -and $State.Group -lt $State.TotalGroups) {
         Set-Group ($State.Group + 1); Render-Frame
         if ($State.Items.Count -gt 0) { Speak-Text $State.Items[0].target }
@@ -1065,20 +1360,48 @@ try {
       if ($State.Typed.Length -eq $target.Length) {
         $State.Streak++
         if ($State.Streak -gt $State.MaxStreak) { $State.MaxStreak = $State.Streak }
-        $State.DoneSet[$State.Index] = $true
+
         if ($State.DeckId -eq 'mistakes' -and $State.WordErrors -eq 0) {
-          if (Remove-Mistake $item) {
-            $State.StatusMsg = "输入正确！已从错题本移除（剩余 $(@($Persisted.mistakes).Count) 条）"
+          $null = Remove-Mistake $item.target
+          Sync-MistakeDeckItems
+          $newDone = @{}
+          foreach ($k in $State.DoneSet.Keys) {
+            if ($k -lt $State.Index) { $newDone[$k] = $true }
+            elseif ($k -gt $State.Index) { $newDone[$k - 1] = $true }
           }
-        }
-        Render-Frame
-        if ($State.Index + 1 -ge $State.Items.Count) {
-          $State.Finished = $true; Render-Frame
+          $State.DoneSet = $newDone
+          $State.Typed = ''
+          $State.HasError = $false
+          $State.Peek = $false
+          $State.WordWrong = $false
+          $State.WordErrors = 0
+          if ($Persisted.mistakes.Count -eq 0) {
+            $State.Finished = $true
+            $State.StatusMsg = '恭喜！错题本已全部答对清空'
+            Render-Frame
+          } elseif ($State.Index -ge $State.Items.Count) {
+            $State.Finished = $true
+            $State.StatusMsg = "本组已练习完，当前错题本剩余 $($Persisted.mistakes.Count) 条"
+            Render-Frame
+          } else {
+            $State.StatusMsg = "输入正确！已从错题本移除（剩余 $($Persisted.mistakes.Count) 条）"
+            Render-Frame
+            Speak-Text $State.Items[$State.Index].target
+          }
         } else {
-          Start-Sleep -Milliseconds 100
-          $State.Index++; $State.Typed = ''; $State.Peek = $false; $State.WordWrong = $false; $State.WordErrors = 0
+          $State.DoneSet[$State.Index] = $true
+          if ($State.DeckId -eq 'mistakes') {
+            $State.StatusMsg = "本条本轮有误敲（$($State.WordErrors) 次），暂保留在错题本"
+          }
           Render-Frame
-          Speak-Text $State.Items[$State.Index].target
+          if ($State.Index + 1 -ge $State.Items.Count) {
+            $State.Finished = $true; Render-Frame
+          } else {
+            Start-Sleep -Milliseconds 100
+            $State.Index++; $State.Typed = ''; $State.Peek = $false; $State.WordWrong = $false; $State.WordErrors = 0
+            Render-Frame
+            Speak-Text $State.Items[$State.Index].target
+          }
         }
       } else {
         Render-Frame
@@ -1088,15 +1411,25 @@ try {
       $State.Streak = 0
       $State.WordErrors++
       if ($State.Dictation) {
-        if ($State.WordErrors -gt 3) {
+        if ($State.DeckId -eq 'mistakes') {
+          if ($State.WordErrors -gt 3 -and -not $State.WordWrong) {
+            $State.WordWrong = $true
+            $null = Add-Mistake $item
+          }
+          $State.StatusMsg = "拼写有误（本轮错 $($State.WordErrors) 次，无误敲才移出错题本）"
+        } elseif ($State.WordErrors -gt 3) {
           if (-not $State.WordWrong) {
             $State.WordWrong = $true
-            Add-Mistake $item
+            $addRes = Add-Mistake $item
+            $State.StatusMsg = if ($addRes -eq 'updated') { "本词累计敲错 $($State.WordErrors) 次（已在错题本中）" } else { "本词敲错超过 3 次（第 $($State.WordErrors) 次），已加入错题本" }
+          } else {
+            $State.StatusMsg = "本词累计敲错 $($State.WordErrors) 次，已加入错题本"
           }
-          $State.StatusMsg = "本词累计敲错 $($State.WordErrors) 次（超过 3 次），已加入错题本"
         } else {
-          $State.StatusMsg = "拼写有误（本词第 $($State.WordErrors) 次，超过 3 次加入错题本）"
+          $State.StatusMsg = "拼写有误（本词第 $($State.WordErrors)/3 次，超过 3 次加入错题本）"
         }
+      } elseif ($State.DeckId -eq 'mistakes') {
+        $State.StatusMsg = "拼写有误（本轮错 $($State.WordErrors) 次，全对才会移出错题本）"
       } else {
         $State.StatusMsg = '拼写有误，请继续'
       }
