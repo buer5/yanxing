@@ -1,4 +1,4 @@
-param(
+﻿param(
   [Alias('b')][string]$Book = '',
   [Alias('g')][int]$Group = 0,
   [Alias('s')][int]$Size = 20,
@@ -308,9 +308,12 @@ public static class WinConsole {
 
 # ── 本地 SQLite 数据库（进程内调用 winsqlite3.dll） ──
 $script:SqliteReady = $false
+$script:LastDbOk = $false
+$script:LastSaveOk = $false
 $script:WinSqlitePath = Join-Path $env:WINDIR 'System32\winsqlite3.dll'
 try {
-  if ((Test-Path $script:WinSqlitePath) -and -not ('WinSqlite' -as [type])) {
+  if (-not (Test-Path $script:WinSqlitePath)) { throw 'winsqlite3.dll missing' }
+  if (-not ('WinSqlite' -as [type])) {
     $dllEsc = $script:WinSqlitePath.Replace('\', '\\')
     Add-Type -TypeDefinition @"
 using System;
@@ -352,16 +355,31 @@ public static class WinSqlite {
 } catch { $script:SqliteReady = $false }
 
 function Invoke-DbQuery([string]$sql, [object[]]$params = @()) {
+  $script:LastDbOk = $false
   $rows = [System.Collections.Generic.List[object[]]]::new()
   if (-not $script:SqliteReady -or [string]::IsNullOrWhiteSpace($script:DbPath)) { return ,$rows }
-  $db = [IntPtr]::Zero
-  try {
-    if ([WinSqlite]::sqlite3_open_v2([System.Text.Encoding]::UTF8.GetBytes($script:DbPath + "`0"), [ref]$db, 6, [IntPtr]::Zero) -ne 0) { return ,$rows }
-  } catch { return ,$rows }
-  try {
-    foreach ($pSql in @('PRAGMA busy_timeout=3000;', $sql)) {
-      $stmt = [IntPtr]::Zero; $tail = [IntPtr]::Zero
-      if ([WinSqlite]::sqlite3_prepare_v2($db, [System.Text.Encoding]::UTF8.GetBytes($pSql + "`0"), -1, [ref]$stmt, [ref]$tail) -eq 0) {
+  for ($attempt = 0; $attempt -lt 3; $attempt++) {
+    $rows.Clear()
+    $db = [IntPtr]::Zero
+    try {
+      if ([WinSqlite]::sqlite3_open_v2([System.Text.Encoding]::UTF8.GetBytes($script:DbPath + "`0"), [ref]$db, 6, [IntPtr]::Zero) -ne 0) {
+        if ($db -ne [IntPtr]::Zero) { [void][WinSqlite]::sqlite3_close($db) }
+        Start-Sleep -Milliseconds 60
+        continue
+      }
+    } catch { return ,$rows }
+    $busyRetry = $false
+    $queryDone = $false
+    try {
+      foreach ($pSql in @('PRAGMA busy_timeout=5000;', $sql)) {
+        $stmt = [IntPtr]::Zero; $tail = [IntPtr]::Zero
+        $prepRc = [WinSqlite]::sqlite3_prepare_v2($db, [System.Text.Encoding]::UTF8.GetBytes($pSql + "`0"), -1, [ref]$stmt, [ref]$tail)
+        if ($prepRc -eq 5 -or $prepRc -eq 6) {
+          if ($stmt -ne [IntPtr]::Zero) { [void][WinSqlite]::sqlite3_finalize($stmt) }
+          $busyRetry = $true
+          break
+        }
+        if ($prepRc -ne 0) { break }
         try {
           if ($pSql -eq $sql) {
             for ($i = 0; $i -lt $params.Count; $i++) {
@@ -374,7 +392,8 @@ function Invoke-DbQuery([string]$sql, [object[]]$params = @()) {
               }
             }
           }
-          while ([WinSqlite]::sqlite3_step($stmt) -eq 100) {
+          $stepRc = 0
+          while (($stepRc = [WinSqlite]::sqlite3_step($stmt)) -eq 100) {
             if ($pSql -eq $sql) {
               $cols = @()
               for ($c = 0; $c -lt 4; $c++) {
@@ -385,11 +404,26 @@ function Invoke-DbQuery([string]$sql, [object[]]$params = @()) {
               $rows.Add($cols)
             }
           }
+          if ($stepRc -eq 5 -or $stepRc -eq 6) { $busyRetry = $true; break }
+          if ($stepRc -ne 101) { break }
+          if ($pSql -eq $sql) { $queryDone = $true }
         } finally { [void][WinSqlite]::sqlite3_finalize($stmt) }
       }
+    } finally { [void][WinSqlite]::sqlite3_close($db) }
+    if ($queryDone) {
+      $script:LastDbOk = $true
+      return ,$rows
     }
-  } finally { [void][WinSqlite]::sqlite3_close($db) }
+    if (-not $busyRetry) { break }
+    Start-Sleep -Milliseconds 60
+  }
   return ,$rows
+}
+
+function Remove-LegacyStateFile {
+  if ($LegacyStateFile -and (Test-Path $LegacyStateFile)) {
+    try { Remove-Item $LegacyStateFile -Force -ErrorAction SilentlyContinue } catch {}
+  }
 }
 
 if ($script:SqliteReady) {
@@ -424,7 +458,17 @@ function Normalize-Mistakes($rawList) {
 }
 
 $dbStateRows = Invoke-DbQuery "SELECT value FROM user_setting WHERE setting_key = ?;" @('cli.typing.state')
-$rawStateJson = if ($dbStateRows.Count -gt 0 -and $dbStateRows[0].Count -gt 0) { $dbStateRows[0][0] } elseif (Test-Path $LegacyStateFile) { Get-Content $LegacyStateFile -Raw -Encoding UTF8 } else { '' }
+$dbSelectOk = $script:LastDbOk
+$migratedFromLegacy = $false
+if ($dbStateRows.Count -gt 0 -and $dbStateRows[0].Count -gt 0) {
+  $rawStateJson = $dbStateRows[0][0]
+  Remove-LegacyStateFile
+} elseif ((-not $script:SqliteReady -or $dbSelectOk) -and (Test-Path $LegacyStateFile)) {
+  $rawStateJson = Get-Content $LegacyStateFile -Raw -Encoding UTF8
+  $migratedFromLegacy = $true
+} else {
+  $rawStateJson = ''
+}
 if ($rawStateJson) {
   try {
     $loaded = $rawStateJson | ConvertFrom-Json
@@ -440,6 +484,7 @@ if ($rawStateJson) {
 }
 
 function Save-State {
+  $script:LastSaveOk = $false
   try {
     $mArr = [object[]]$Persisted.mistakes.ToArray()
     $obj = @{
@@ -451,9 +496,20 @@ function Save-State {
       mistakes = $mArr
     }
     $json = $obj | ConvertTo-Json -Depth 4 -Compress
-    $nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-    $null = Invoke-DbQuery "INSERT INTO user_setting (setting_key, value, edit_time, dirty) VALUES (?, ?, ?, 0) ON CONFLICT(setting_key) DO UPDATE SET value=excluded.value, edit_time=excluded.edit_time;" @('cli.typing.state', $json, $nowMs)
-  } catch {}
+    if ($script:SqliteReady) {
+      $nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+      $null = Invoke-DbQuery "INSERT INTO user_setting (setting_key, value, edit_time, dirty) VALUES (?, ?, ?, 0) ON CONFLICT(setting_key) DO UPDATE SET value=excluded.value, edit_time=excluded.edit_time;" @('cli.typing.state', $json, $nowMs)
+      $script:LastSaveOk = $script:LastDbOk
+      if ($script:LastSaveOk) { Remove-LegacyStateFile }
+    } elseif ($LegacyStateFile) {
+      [System.IO.File]::WriteAllText($LegacyStateFile, $json, [System.Text.UTF8Encoding]::new($false))
+      $script:LastSaveOk = $true
+    }
+  } catch { $script:LastSaveOk = $false }
+}
+
+if ($migratedFromLegacy -and $script:SqliteReady) {
+  Save-State
 }
 
 # ── 词库加载 ──
@@ -1034,7 +1090,7 @@ function Render-Frame {
         $detailLines.Add("$C_YELLOW" + (Fit-Plain $dl $mainInner) + $C_RESET)
       }
 
-      $clearLbl = if ($State.ConfirmClearMistakes) { '[再按C确认清空]' } else { '[C 清空]' }
+      $clearLbl = if ($State.ConfirmClearMistakes) { '[确认清空]' } else { '[C 清空]' }
       $clearCol = if ($State.ConfirmClearMistakes) { $C_RED } else { $C_WHITE }
       $mBtnSpecs = @(
         @{ text = '[Enter 循环听写]'; action = 'practice-mistakes'; color = $C_CYAN },
@@ -1384,7 +1440,11 @@ function Handle-Action([string]$action, $val = $null) {
               $State.Index = 0
             }
           }
-          $State.StatusMsg = "已从错题本移除「$removedTarget」（剩余 $($Persisted.mistakes.Count) 条）"
+          $State.StatusMsg = if ($script:LastSaveOk) {
+            "已从错题本移除「$removedTarget」（剩余 $($Persisted.mistakes.Count) 条）"
+          } else {
+            '移出未保存：数据库被占用，请稍后重试'
+          }
         }
       }
     }
@@ -1393,14 +1453,14 @@ function Handle-Action([string]$action, $val = $null) {
         $State.ConfirmClearMistakes = $false
       } elseif (-not $State.ConfirmClearMistakes) {
         $State.ConfirmClearMistakes = $true
-        $State.StatusMsg = "确认清空全部 $($Persisted.mistakes.Count) 条错题？再按 C / 点击确认清空"
+        $State.StatusMsg = "确认清空全部 $($Persisted.mistakes.Count) 条错题？再按 C / 点击[确认清空]"
       } else {
         Clear-Mistakes
         $State.ConfirmClearMistakes = $false
         $State.CursorIdx = 0
         $State.ScrollTop = 0
         if ($isMistakeDeck) { Sync-MistakeDeckItems }
-        $State.StatusMsg = '已清空全部错题'
+        $State.StatusMsg = if ($script:LastSaveOk) { '已清空全部错题' } else { '清空未保存：数据库被占用，请稍后重试' }
       }
     }
     'open-file' { $State.Overlay = 'input-file'; $State.PromptBuf = '' }
