@@ -1814,7 +1814,8 @@ function Read-InputEvent {
             return @{ kind = 'mouse'; btn = 0; x = $vpX; y = $vpY; type = 'M' }
           }
         } elseif ($flags -eq 4) {
-          $delta = [int16]([uint32]$me.dwButtonState -shr 16)
+          $delta = [int]([uint32]$me.dwButtonState -shr 16)
+          if ($delta -ge 32768) { $delta -= 65536 }
           $wBtn = if ($delta -gt 0) { 64 } else { 65 }
           return @{ kind = 'mouse'; btn = $wBtn; x = $vpX; y = $vpY; type = 'M' }
         }
